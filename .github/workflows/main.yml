@@ -1,0 +1,131 @@
+name: CI
+
+on:
+  push:
+    # on every branch
+    branches:
+      - '**'
+
+env:
+  PIP_CACHE_DIR: ${{ github.workspace }}/.cache/pip
+  RUST_BACKTRACE: 1
+
+jobs:
+  static_analysis:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install dependencies with uv
+        run: |
+          pip install uv
+          uv venv
+          uv pip install -e ".[dev,tests,lint]"
+
+      - name: Run pre-commit hooks
+        run: |
+          uv run pre-commit run --all-files
+
+        continue-on-error: false
+
+      - name: Upload pre-commit report
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: pre-commit-report
+          path: pre-commit-report
+
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-latest, windows-latest]
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13", "3.14"]
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install uv
+        run: pip install uv
+
+      - name: Build and install with maturin
+        run: |
+          uv venv
+          uv pip install -e .
+
+      - name: Run tests with coverage
+        env:
+          COVERAGE_FILE: .coverage.${{ matrix.os }}.${{ matrix.python-version }}
+        run: |
+          uv run pytest \
+            --cov=dxf_io \
+            --cov-config=.coveragerc \
+            --cov-report=term \
+            --color=yes
+
+      - name: Upload coverage artifact
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-${{ matrix.os }}-${{ matrix.python-version }}
+          path: ${{ github.workspace }}/.coverage.${{ matrix.os }}.${{ matrix.python-version }}
+          include-hidden-files: true
+          if-no-files-found: error
+
+
+  coverage-merge:
+    runs-on: ubuntu-22.04
+    needs:
+      - build
+
+    if: always()
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - name: Install coverage
+        run: pip install coverage
+
+      - name: Download all coverage artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: coverage-data
+
+      - name: Combine coverage
+        run: |
+          find coverage-data -name '.coverage*' -print
+          coverage combine $(find coverage-data -name '.coverage*')
+          coverage report -m
+          coverage html
+          coverage xml
+
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v7
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: coverage.xml
