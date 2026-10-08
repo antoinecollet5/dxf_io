@@ -1,0 +1,134 @@
+[build-system]
+requires = ["maturin>=0.14,<0.15"]
+build-backend = "maturin"
+
+[project]
+name = "dxf_io"
+version = "0.1.0"
+description = "Fast Rust-based DXF mesh reader-writer with pyvista and shapely support."
+readme = "README.rst"
+requires-python = ">=3.8"
+authors = [{ name = "Antoine Collet", email = "antoine.collet5@gmail.com" }]
+keywords = ["DXF", "mesh", "parsing", "geometry", "Rust", "performance"]
+license = { file = "LICENSE" }
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: BSD License",
+    "Natural Language :: English",
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Utilities",
+]
+
+dependencies = [
+    "numpy>=1.20.0",
+]
+
+[project.optional-dependencies]
+all = ["dxf_io[dev, docs, lint, tests, visualization, examples]"]
+visualization = [
+    "pyvista>=0.40.0",
+    "pymeshfix>=0.16.0",
+]
+manifold = [
+    "manifold3d>=3.0.0",
+]
+examples = ["marimo"]
+dev = ["maturin>=0.14", "setuptools-rust"]
+docs = [
+    "sphinx<9",
+    "pydata-sphinx-theme",
+    "sphinx-rtd-theme",
+]
+tests = [
+    "pytest>=7.0",
+    "pytest-cov",
+    "coverage",
+    "pyvista>=0.40.0",
+    "pymeshfix>=0.16.0",
+]
+lint = [
+    "pre-commit",
+    "pre-commit-hooks",
+    "codespell>=2.1.0",
+    "ruff==0.16.10",
+    "ty==0.0.78",
+]
+
+[project.urls]
+Homepage = "https://github.com/antoinecollet5/dxf_io"
+Documentation = "https://github.com/antoinecollet5/dxf_io#readme"
+Repository = "https://github.com/antoinecollet5/dxf_io"
+Issues = "https://github.com/antoinecollet5/dxf_io/issues"
+Changelog = "https://github.com/antoinecollet5/dxf_io/releases"
+
+[tool.maturin]
+python-source = "python"
+module-name = "dxf_io"
+features = ["pyo3/extension-module"]
+
+[tool.ruff]
+lint.select = [
+    "F",    # Pyflakes
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "I",    # isort
+]
+src = ["python", "tests"]
+line-length = 100
+
+exclude = [
+    ".bzr",
+    ".direnv",
+    ".eggs",
+    ".git",
+    ".hg",
+    ".mypy_cache",
+    ".nox",
+    ".pants.d",
+    ".pytype",
+    ".ruff_cache",
+    ".svn",
+    ".tox",
+    ".venv",
+    "__pypackages__",
+    "_build",
+    "buck-out",
+    "build",
+    "dist",
+    "node_modules",
+    "venv",
+]
+
+[tool.ty.src]
+include = ["python", "tests"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-v --strict-markers"
+
+[tool.coverage.run]
+source = ["dxf_io"]
+branch = true
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+    "^\\s*@abstractmethod",
+]
