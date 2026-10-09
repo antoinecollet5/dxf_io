@@ -71,7 +71,7 @@ jobs:
       - name: Build and install with maturin
         run: |
           uv venv
-          uv pip install -e .
+          uv pip install -e .[all]
 
       - name: Run tests with coverage
         env:
