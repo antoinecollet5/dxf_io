@@ -36,11 +36,11 @@ class TestParsing:
     def test_parse_simple(self) -> None:
         """Test parsing simple DXF."""
         result = parse_dxf_fast(SIMPLE_DXF)
-        assert "points" in result
-        assert "faces" in result
-        assert "labels" in result
-        assert len(result["points"]) > 0
-        assert len(result["faces"]) > 0
+        assert result.points
+        assert result.faces
+        assert result.labels
+        assert len(result.points) > 0
+        assert len(result.faces) > 0
 
     def test_parse_file(self) -> None:
         """Test parsing from file."""
@@ -48,7 +48,7 @@ class TestParsing:
             dxf_path = Path(tmpdir) / "test.dxf"
             dxf_path.write_text(SIMPLE_DXF, encoding="utf-8")
             result = parse_dxf_fast(str(dxf_path))
-            assert "points" in result
+            assert result.points
 
     def test_components(self) -> None:
         """Test component extraction."""
@@ -60,9 +60,9 @@ class TestParsing:
         """Test mesh properties."""
         result = parse_dxf_fast(SIMPLE_DXF)
         mesh = MeshWithAttributes(
-            result["points"],
-            result["faces"],
-            result["labels"],
+            result.points,
+            result.faces,
+            result.labels,
         )
         assert mesh.n_points > 0
         assert mesh.n_faces > 0
@@ -76,9 +76,9 @@ class TestWriting:
         """Test writing DXF."""
         result = parse_dxf_fast(SIMPLE_DXF)
         mesh = MeshWithAttributes(
-            result["points"],
-            result["faces"],
-            result["labels"],
+            result.points,
+            result.faces,
+            result.labels,
         )
         dxf_output = mesh.to_dxf()
         assert "3DFACE" in dxf_output
@@ -90,9 +90,9 @@ class TestWriting:
             output_path = Path(tmpdir) / "output.dxf"
             result = parse_dxf_fast(SIMPLE_DXF)
             mesh = MeshWithAttributes(
-                result["points"],
-                result["faces"],
-                result["labels"],
+                result.points,
+                result.faces,
+                result.labels,
             )
             mesh.to_dxf(str(output_path))
             assert output_path.exists()

@@ -247,7 +247,7 @@ class MeshWithAttributes:
     @property
     def n_components(self) -> int:
         """Number of connected components."""
-        return int(self.labels.max()) + 1
+        return int(np.max(self.labels)) + 1
 
     def to_dxf(self, output_file: Optional[str] = None) -> str:
         """Export to DXF format.
