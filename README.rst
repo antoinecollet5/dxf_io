@@ -64,7 +64,7 @@ Contributions are welcome!
     :target: https://github.com/antoinecollet5/dxf_io/actions/workflows/main.yml
     :alt: Build Status
 
-.. |codecov| https://codecov.io/gh/antoinecollet5/dxf_io/graph/badge.svg?token=CxdQ0SkRbx
+.. |codecov| image:: https://codecov.io/gh/antoinecollet5/dxf_io/graph/badge.svg?token=CxdQ0SkRbx
     :target: https://codecov.io/gh/antoinecollet5/dxf_io
     :alt: Code Coverage
 
