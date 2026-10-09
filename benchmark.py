@@ -27,7 +27,7 @@ def bench_parse(func, dxf_file: str, decimals: int = 6, n_runs: int = 3) -> Tupl
         result = func(dxf_file, decimals)
         t1 = time.perf_counter()
         times.append(t1 - t0)
-        print(f"  Run {i+1}/{n_runs}: {times[-1]:.3f}s", flush=True)
+        print(f"  Run {i + 1}/{n_runs}: {times[-1]:.3f}s", flush=True)
 
     times.sort()
     median_time = times[n_runs // 2]
@@ -37,9 +37,9 @@ def bench_parse(func, dxf_file: str, decimals: int = 6, n_runs: int = 3) -> Tupl
         "median": median_time,
         "max": max(times),
         "mean": np.mean(times),
-        "n_points": int(result.points.shape[0]) if hasattr(result, 'points') else None,
-        "n_faces": int(result.faces.shape[0]) if hasattr(result, 'faces') else None,
-        "n_components": int(result.n_components) if hasattr(result, 'n_components') else None,
+        "n_points": int(result.points.shape[0]) if hasattr(result, "points") else None,
+        "n_faces": int(result.faces.shape[0]) if hasattr(result, "faces") else None,
+        "n_components": int(result.n_components) if hasattr(result, "n_components") else None,
     }
     return median_time, stats
 
@@ -63,16 +63,18 @@ def main():
     print("RUST + PyO3 (dxf_io_wrapper)")
     print("=" * 60)
     try:
-        from dxf_io_wrapper import parse_dxf_fast as rust_parse
+        from dxf_io import parse_dxf_fast as rust_parse
 
         print("Parsing (3 runs)...")
         rust_time, rust_stats = bench_parse(rust_parse, dxf_file, n_runs=3)
 
-        print(f"\nResults:")
+        print("\nResults:")
         print(f"  Points: {rust_stats['n_points']}")
         print(f"  Faces: {rust_stats['n_faces']}")
         print(f"  Components: {rust_stats['n_components']}")
-        print(f"  Time: {rust_time:.3f}s (min={rust_stats['min']:.3f}, max={rust_stats['max']:.3f})")
+        print(
+            f"  Time: {rust_time:.3f}s (min={rust_stats['min']:.3f}, max={rust_stats['max']:.3f})"
+        )
 
     except ImportError as e:
         print(f"⚠️  Rust version not available: {e}")
@@ -90,13 +92,13 @@ def main():
         print("Parsing (1 run, may be slow)...")
 
         t0 = time.perf_counter()
-        py_meshes = python_parse(dxf_file, decimals=6, repair=False)
+        py_meshes = python_parse(dxf_file, decimals=6)
         python_time = time.perf_counter() - t0
 
         py_n_points = sum(m.n_points for m in py_meshes)
         py_n_faces = sum(m.n_faces for m in py_meshes)
 
-        print(f"\nResults:")
+        print("\nResults:")
         print(f"  Points: {py_n_points}")
         print(f"  Faces: {py_n_faces}")
         print(f"  Components: {len(py_meshes)}")
@@ -118,7 +120,7 @@ def main():
         print(f"Python: {python_time:.3f}s")
         print(f"Speedup: {speedup:.1f}x faster with Rust\n")
 
-        if rust_stats and abs(rust_stats['n_faces'] - py_n_faces) > 0:
+        if rust_stats and abs(rust_stats["n_faces"] - py_n_faces) > 0:
             print(f"⚠️  Face count mismatch: Rust={rust_stats['n_faces']}, Python={py_n_faces}")
         else:
             print("✅ Results match between implementations")
