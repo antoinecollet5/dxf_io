@@ -1,32 +1,103 @@
 """Basic tests for dxf_io."""
 
+import tempfile
+from pathlib import Path
+
 import pytest
 
+from dxf_io import MeshWithAttributes, dxf_to_manifold_meshes, parse_dxf_fast
 
-def test_import():
-    """Test that the module can be imported."""
-    try:
-        import dxf_io
-        assert hasattr(dxf_io, 'parse_dxf_fast')
-    except ImportError:
-        pytest.skip("Rust extension not built yet. Run: maturin develop -r")
+SIMPLE_DXF = """SOLID
+10
+0.0
+20
+0.0
+30
+0.0
+10
+1.0
+20
+0.0
+30
+0.0
+10
+0.0
+20
+1.0
+30
+0.0
+ENDSOL
+"""
 
 
-def test_wrapper_import():
-    """Test that the wrapper can be imported."""
-    try:
-        from dxf_io_wrapper import dxf_to_manifold_meshes
-        assert callable(dxf_to_manifold_meshes)
-    except ImportError as e:
-        pytest.skip(f"Wrapper import failed: {e}")
+class TestParsing:
+    """Test DXF parsing."""
+
+    def test_parse_simple(self) -> None:
+        """Test parsing simple DXF."""
+        result = parse_dxf_fast(SIMPLE_DXF)
+        assert "points" in result
+        assert "faces" in result
+        assert "labels" in result
+        assert len(result["points"]) > 0
+        assert len(result["faces"]) > 0
+
+    def test_parse_file(self) -> None:
+        """Test parsing from file."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dxf_path = Path(tmpdir) / "test.dxf"
+            dxf_path.write_text(SIMPLE_DXF, encoding="utf-8")
+            result = parse_dxf_fast(str(dxf_path))
+            assert "points" in result
+
+    def test_components(self) -> None:
+        """Test component extraction."""
+        meshes = dxf_to_manifold_meshes(SIMPLE_DXF, use_pyvista=False)
+        assert len(meshes) > 0
+        assert isinstance(meshes[0], MeshWithAttributes)
+
+    def test_mesh_properties(self) -> None:
+        """Test mesh properties."""
+        result = parse_dxf_fast(SIMPLE_DXF)
+        mesh = MeshWithAttributes(
+            result["points"],
+            result["faces"],
+            result["labels"],
+        )
+        assert mesh.n_points > 0
+        assert mesh.n_faces > 0
+        assert mesh.n_components > 0
 
 
-@pytest.mark.parametrize("decimals", [3, 6, 8])
-def test_decimals_parameter(decimals):
-    """Test that decimals parameter is accepted."""
-    try:
-        from dxf_io import RawMesh
-        # Just test that RawMesh can be accessed
-        assert RawMesh is not None
-    except ImportError:
-        pytest.skip("Rust extension not built yet")
+class TestWriting:
+    """Test DXF writing."""
+
+    def test_write_dxf(self) -> None:
+        """Test writing DXF."""
+        result = parse_dxf_fast(SIMPLE_DXF)
+        mesh = MeshWithAttributes(
+            result["points"],
+            result["faces"],
+            result["labels"],
+        )
+        dxf_output = mesh.to_dxf()
+        assert "3DFACE" in dxf_output
+        assert "SECTION" in dxf_output
+
+    def test_roundtrip(self) -> None:
+        """Test read-write roundtrip."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_path = Path(tmpdir) / "output.dxf"
+            result = parse_dxf_fast(SIMPLE_DXF)
+            mesh = MeshWithAttributes(
+                result["points"],
+                result["faces"],
+                result["labels"],
+            )
+            mesh.to_dxf(str(output_path))
+            assert output_path.exists()
+            assert output_path.stat().st_size > 0
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

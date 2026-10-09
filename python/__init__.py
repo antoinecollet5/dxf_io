@@ -13,10 +13,10 @@ Basic Usage:
 """
 
 from .dxf_io import (
+    MeshWithAttributes,
     dxf_to_manifold_meshes,
     parse_dxf_fast,
     write_dxf_fast,
-    MeshWithAttributes,
 )
 
 __version__ = "0.1.0"

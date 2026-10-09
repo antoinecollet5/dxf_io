@@ -78,14 +78,21 @@ module-name = "dxf_io"
 features = ["pyo3/extension-module"]
 
 [tool.ruff]
-lint.select = [
+src = ["python", "tests"]
+line-length = 100
+
+[tool.ruff.lint]
+select = [
     "F",    # Pyflakes
     "E",    # pycodestyle errors
     "W",    # pycodestyle warnings
     "I",    # isort
 ]
-src = ["python", "tests"]
-line-length = 100
+fixable = ["A", "B", "C", "D", "E", "F", "I"]
+unfixable = []
+
+[tool.ruff.lint.isort]
+known-first-party = ["dxf_io"]
 
 exclude = [
     ".bzr",

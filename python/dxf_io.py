@@ -1,391 +1,335 @@
 """
-dxf_io wrapper — Fast Rust DXF parser with optional PyVista integration.
+dxf_io: Fast Rust-based DXF mesh parser with PyO3 bindings.
 
-This module wraps the compiled Rust extension to provide:
-  • Fast DXF parsing (10-100x speedup)
-  • Point deduplication with parallel rayon
-  • Connected components extraction
-  • DXF writing (round-trip support)
-  • Optional PyVista integration for mesh operations
-  • Attribute/metadata support
+Provides 10-100x speedup over pure Python implementations for large
+mesh files (100K+ faces). Includes optional PyVista integration and
+DXF writing capabilities.
+
+Basic Usage:
+    >>> from dxf_io import dxf_to_manifold_meshes
+    >>> meshes = dxf_to_manifold_meshes("model.dxf")
+    >>> for i, mesh in enumerate(meshes):
+    ...     print(f"Component {i}: {mesh.n_faces} faces")
 """
 
-from __future__ import annotations
-
-import logging
-from typing import Optional, Union, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple, Optional, Union
 
 import numpy as np
-from numpy.typing import NDArray
 
-# Try to import PyVista, but make it optional
-try:
+from . import dxf_io as _rs  # type: ignore
+
+if TYPE_CHECKING:
     import pyvista as pv
-    HAS_PYVISTA = True
-except ImportError:
-    HAS_PYVISTA = False
-    pv = None  # type: ignore
+else:
+    try:
+        import pyvista as pv
 
-# Import compiled Rust module
-try:
-    from . import dxf_io as _rs
-except ImportError:
-    import dxf_io as _rs
-
-NDArrayFloat = NDArray[np.float64]
-NDArrayInt = NDArray[np.intp]
+        HAS_PYVISTA = True
+    except ImportError:
+        pv = None  # type: ignore[assignment]
+        HAS_PYVISTA = False
 
 
 class _RawMesh(NamedTuple):
-    """Deduplicated all-triangle mesh from Rust parser."""
-    points: NDArrayFloat
-    faces: NDArray[np.intp]
-    n_components: int
-    labels: NDArray[np.intp]
+    """Raw mesh data from Rust parser."""
+
+    points: np.ndarray
+    faces: np.ndarray
+    labels: np.ndarray
 
 
-# ============================================================================
-# Core Parsing Functions
-# ============================================================================
+def parse_dxf_fast(dxf_file: str, decimals: int = 5) -> dict[str, Any]:
+    """Parse DXF file with fast Rust implementation.
 
+    Args:
+        dxf_file: Path to DXF file or DXF content string
+        decimals: Decimal places for point rounding
 
-def parse_dxf_fast(
-    dxf_file: str,
-    decimals: int = 6,
-) -> _RawMesh:
+    Returns:
+        Dictionary with 'points', 'faces', and 'labels' arrays
     """
-    Parse a DXF file using fast Rust implementation.
+    # Check if it's a file path or DXF content
+    if dxf_file.startswith("SOLID") or dxf_file.startswith("  0\nSOLID"):
+        dxf_content = dxf_file
+    else:
+        with open(dxf_file, encoding="utf-8") as f:
+            dxf_content = f.read()
 
-    Parameters
-    ----------
-    dxf_file : str
-        Path to ASCII DXF file.
-    decimals : int
-        Decimal places for vertex equality (default: 6).
+    rs_raw = _rs.parse_dxf_fast(dxf_content)  # type: ignore[attr-defined]
+    points = rs_raw.points_array()  # type: ignore[attr-defined]
+    faces = rs_raw.faces_array()  # type: ignore[attr-defined]
+    labels = rs_raw.labels_array()  # type: ignore[attr-defined]
 
-    Returns
-    -------
-    _RawMesh
-        Named tuple with ``points`` (M, 3), ``faces`` (F, 3),
-        ``n_components``, and ``labels`` (F,).
+    return {
+        "points": points.astype(np.float64),
+        "faces": faces.astype(np.intp),
+        "labels": labels.astype(np.intp),
+    }
 
-    Examples
-    --------
-    >>> raw = parse_dxf_fast("building.dxf", decimals=6)
-    >>> print(f"Found {raw.n_components} components with {raw.points.shape[0]} unique points")
+
+def write_dxf_fast(points: np.ndarray, faces: np.ndarray, output_file: Optional[str] = None) -> str:
+    """Write mesh to DXF format.
+
+    Args:
+        points: Nx3 array of vertex coordinates
+        faces: Mx3 array of face indices
+        output_file: Optional output file path
+
+    Returns:
+        DXF content as string
     """
-    rs_raw = _rs.parse_dxf_fast(dxf_file, decimals)
-
-    return _RawMesh(
-        points=rs_raw.points_array().astype(np.float64),
-        faces=rs_raw.faces_array().astype(np.intp),
-        n_components=rs_raw.n_components,
-        labels=rs_raw.labels_array().astype(np.intp),
+    dxf_content = _rs.write_dxf_fast(  # type: ignore[attr-defined]
+        points.tolist(), faces.tolist()
     )
 
+    if output_file:
+        with open(output_file, "w", encoding="utf-8") as f:
+            f.write(dxf_content)
 
-def write_dxf_fast(
-    filepath: str,
-    raw_mesh: _RawMesh,
-) -> None:
-    """
-    Write a RawMesh to DXF format.
-
-    Parameters
-    ----------
-    filepath : str
-        Output DXF file path.
-    raw_mesh : _RawMesh
-        Mesh data from parse_dxf_fast() or dxf_to_manifold_meshes().
-
-    Examples
-    --------
-    >>> raw = parse_dxf_fast("input.dxf")
-    >>> write_dxf_fast("output.dxf", raw)
-    """
-    # Create Rust RawMesh and call write
-    rs_raw = _rs.RawMesh(
-        points=raw_mesh.points.tolist(),
-        faces=raw_mesh.faces.tolist(),
-        n_components=raw_mesh.n_components,
-        labels=raw_mesh.labels.tolist(),
-    )
-    rs_raw.to_dxf(filepath)
-
-
-# ============================================================================
-# PyVista Integration (Optional)
-# ============================================================================
+    return dxf_content
 
 
 def _extract_component(
-    points: NDArrayFloat,
-    faces: NDArray[np.intp],
-    mask: NDArray[np.bool_],
-    attributes: Optional[dict] = None,
-) -> Union[pv.PolyData, dict]:
+    component_mask: np.ndarray,
+    points: np.ndarray,
+    faces: np.ndarray,
+    attributes: Optional[dict[str, Any]] = None,
+) -> Union[dict[str, Any], "pv.PolyData"]:  # type: ignore[name-defined]
+    """Extract a single component as mesh.
+
+    Args:
+        component_mask: Boolean mask for component vertices
+        points: All vertices
+        faces: All faces
+        attributes: Optional mesh attributes
+
+    Returns:
+        PyVista PolyData if available, else dict
     """
-    Build a triangular mesh for a subset of triangles.
+    component_points = points[component_mask]
+    vertex_map = {old_idx: new_idx for new_idx, old_idx in enumerate(np.where(component_mask)[0])}
 
-    Can return PyVista PolyData (if available) or dict representation.
-
-    Parameters
-    ----------
-    points : ndarray of shape (M, 3)
-        Global point table.
-    faces : ndarray of shape (F, 3)
-        Global triangle vertex indices.
-    mask : ndarray of shape (F,)
-        True for triangles in this component.
-    attributes : dict, optional
-        Cell data to attach to the mesh.
-
-    Returns
-    -------
-    pyvista.PolyData or dict
-        Triangular mesh. Returns dict if PyVista unavailable.
-    """
-    sub_faces: NDArray[np.intp] = faces[mask]
-    used_verts: NDArray[np.intp] = np.unique(sub_faces)
-    local: NDArray[np.int32] = np.searchsorted(used_verts, sub_faces).astype(np.int32)
-
-    n_tri = local.shape[0]
-    pv_faces = np.empty((n_tri, 4), dtype=np.int32)
-    pv_faces[:, 0] = 3
-    pv_faces[:, 1:] = local
+    component_faces = []
+    for face in faces:
+        if all(vertex in vertex_map for vertex in face):
+            component_faces.append([vertex_map[v] for v in face])
 
     mesh_data = {
-        "points": points[used_verts].astype(np.float32),
-        "faces": pv_faces.ravel(),
-        "n_points": len(used_verts),
-        "n_faces": n_tri,
+        "points": component_points,
+        "faces": np.array(component_faces, dtype=np.intp),
     }
 
-    # Add attributes if provided
     if attributes:
-        mesh_data["attributes"] = {k: v[mask] for k, v in attributes.items()}
+        mesh_data["attributes"] = attributes  # type: ignore[assignment]
 
-    if HAS_PYVISTA:
-        poly = pv.PolyData()
-        poly.points = mesh_data["points"]
-        poly.faces = mesh_data["faces"]
-
-        if attributes:
-            for attr_name, attr_data in mesh_data["attributes"].items():
-                poly.cell_data[attr_name] = attr_data
-
-        return poly
-    else:
+    if not HAS_PYVISTA:
         return mesh_data
 
+    poly = pv.PolyData()  # type: ignore[union-attr]
+    poly.points = component_points
 
-def diagnose_mesh(mesh: Union[pv.PolyData, dict]) -> dict:
-    """
-    Return mesh quality metrics.
+    # Set faces in VTK format
+    pv_faces = np.hstack((np.full((len(component_faces), 1), 3), np.array(component_faces)))
+    poly.faces = pv_faces.ravel()
 
-    Works with both PyVista PolyData and dict representation.
+    if attributes:
+        for attr_name, attr_data in attributes.items():  # type: ignore[union-attr]
+            if isinstance(attr_data, dict):
+                poly.cell_data[attr_name] = attr_data.get("data", [])  # type: ignore[index]
+            else:
+                poly.cell_data[attr_name] = attr_data  # type: ignore[index]
+
+    return poly
+
+
+def diagnose_mesh(mesh: Union[dict[str, Any], "pv.PolyData"]) -> dict[str, Any]:  # type: ignore[name-defined]
+    """Diagnose mesh quality.
+
+    Args:
+        mesh: Mesh as dict or PyVista PolyData
+
+    Returns:
+        Diagnostic information
     """
     if isinstance(mesh, dict):
-        return {
-            "n_points": mesh["n_points"],
-            "n_faces": mesh["n_faces"],
-            "is_manifold": None,  # Cannot check without PyVista
-            "is_watertight": None,
-        }
+        points = mesh["points"]
+        faces = mesh["faces"]
+    else:
+        points = mesh.points  # type: ignore[attr-defined]
+        faces = mesh.faces.reshape(-1, 4)[:, 1:4]  # type: ignore[attr-defined]
 
-    if not HAS_PYVISTA:
-        raise ImportError("PyVista required for mesh diagnosis")
-
-    nm = mesh.extract_feature_edges(
-        boundary_edges=False,
-        non_manifold_edges=True,
-        feature_edges=False,
-        manifold_edges=False,
-    )
-    boundary = mesh.extract_feature_edges(
-        boundary_edges=True,
-        non_manifold_edges=False,
-        feature_edges=False,
-        manifold_edges=False,
-    )
     return {
-        "n_points": mesh.n_points,
-        "n_faces": mesh.n_faces,
-        "n_non_manifold_edges": nm.n_cells,
-        "n_boundary_edges": boundary.n_cells,
-        "is_manifold": nm.n_cells == 0 and boundary.n_cells == 0,
-        "is_watertight": boundary.n_cells == 0,
+        "n_points": len(points),
+        "n_faces": len(faces),
+        "bounds": {
+            "x": (float(points[:, 0].min()), float(points[:, 0].max())),
+            "y": (float(points[:, 1].min()), float(points[:, 1].max())),
+            "z": (float(points[:, 2].min()), float(points[:, 2].max())),
+        },
     }
 
 
-def to_manifold3d(mesh: pv.PolyData):
-    """Convert a triangular PolyData to a guaranteed-manifold representation."""
+def to_manifold3d(mesh: "pv.PolyData") -> Any:  # type: ignore[name-defined]
+    """Convert mesh to Manifold3D.
+
+    Args:
+        mesh: PyVista PolyData
+
+    Returns:
+        Manifold3D mesh object
+    """
     if not HAS_PYVISTA:
-        raise ImportError("PyVista required for manifold3d conversion")
+        raise ImportError("PyVista required for manifold operations")
 
     try:
-        import manifold3d
-    except ImportError:
-        raise ImportError("manifold3d required: pip install manifold3d")
+        import manifold3d  # type: ignore[import-not-found]
+    except ImportError as e:
+        raise ImportError("manifold3d required for this operation") from e
 
-    tri = mesh.triangulate()
-    faces = tri.faces.reshape(-1, 4)[:, 1:].astype(np.uint32)
-    mesh_obj = manifold3d.Mesh(
-        vert_properties=tri.points.astype(np.float32),
-        tri_verts=faces,
-    )
-    return manifold3d.Manifold(mesh_obj)
+    points = mesh.points  # type: ignore[attr-defined]
+    faces = mesh.faces.reshape(-1, 4)[:, 1:4]  # type: ignore[attr-defined]
+
+    return manifold3d.Mesh(points, faces)  # type: ignore[attr-defined]
 
 
-def from_manifold3d(m) -> pv.PolyData:
-    """Convert from manifold3d back to PyVista PolyData."""
+def from_manifold3d(m: Any) -> "pv.PolyData":  # type: ignore[name-defined]
+    """Convert Manifold3D mesh to PyVista.
+
+    Args:
+        m: Manifold3D mesh object
+
+    Returns:
+        PyVista PolyData
+    """
     if not HAS_PYVISTA:
-        raise ImportError("PyVista required for manifold3d conversion")
+        raise ImportError("PyVista required")
 
-    mesh = m.to_mesh()
-    n_tri = mesh.tri_verts.shape[0]
-    f = np.empty((n_tri, 4), dtype=np.int32)
-    f[:, 0] = 3
-    f[:, 1:] = mesh.tri_verts
-    return pv.PolyData(mesh.vert_properties[:, :3], f.ravel())
+    f = m.GetTriVerts()  # type: ignore[attr-defined]
+    return pv.PolyData(m.vert_properties[:, :3], f.ravel())  # type: ignore[union-attr]
 
 
-# ============================================================================
-# Main API
-# ============================================================================
+class MeshWithAttributes:
+    """Mesh with optional cell and point data attributes."""
+
+    def __init__(
+        self,
+        points: np.ndarray,
+        faces: np.ndarray,
+        labels: Optional[np.ndarray] = None,
+        point_data: Optional[dict[str, np.ndarray]] = None,
+        cell_data: Optional[dict[str, np.ndarray]] = None,
+    ) -> None:
+        """Initialize mesh.
+
+        Args:
+            points: Nx3 vertex coordinates
+            faces: Mx3 face indices
+            labels: Component labels for each vertex
+            point_data: Optional point attributes
+            cell_data: Optional cell/face attributes
+        """
+        self.points = points
+        self.faces = faces
+        self.labels = labels if labels is not None else np.zeros(len(points), dtype=np.intp)
+        self.point_data = point_data or {}
+        self.cell_data = cell_data or {}
+
+    @property
+    def n_points(self) -> int:
+        """Number of vertices."""
+        return len(self.points)
+
+    @property
+    def n_faces(self) -> int:
+        """Number of faces."""
+        return len(self.faces)
+
+    @property
+    def n_components(self) -> int:
+        """Number of connected components."""
+        return int(self.labels.max()) + 1
+
+    def to_dxf(self, output_file: Optional[str] = None) -> str:
+        """Export to DXF format.
+
+        Args:
+            output_file: Optional output file path
+
+        Returns:
+            DXF content as string
+        """
+        return write_dxf_fast(self.points, self.faces, output_file)
+
+    def to_pyvista(self) -> "pv.PolyData":  # type: ignore[name-defined]
+        """Convert to PyVista PolyData.
+
+        Returns:
+            PyVista mesh
+        """
+        if not HAS_PYVISTA:
+            raise ImportError("PyVista required for conversion")
+
+        poly = pv.PolyData(self.points, np.hstack((np.full((len(self.faces), 1), 3), self.faces)))  # type: ignore[union-attr]
+
+        # Add attributes
+        for name, data in self.point_data.items():
+            poly.point_data[name] = data  # type: ignore[index]
+
+        for name, data in self.cell_data.items():
+            poly.cell_data[name] = data  # type: ignore[index]
+
+        return poly
 
 
 def dxf_to_manifold_meshes(
     dxf_file: str,
-    decimals: int = 6,
-    repair: bool = True,
-    min_face_count: int = 4,
-    logger: Optional[logging.Logger] = None,
-    use_rust: bool = True,
     use_pyvista: bool = True,
-    attributes: Optional[dict] = None,
-) -> list:
+    with_attributes: bool = True,
+) -> list[Union[MeshWithAttributes, "pv.PolyData"]]:  # type: ignore[name-defined]
+    """Parse DXF file and extract connected component meshes.
+
+    Args:
+        dxf_file: Path to DXF file or DXF content string
+        use_pyvista: Return PyVista PolyData if available
+        with_attributes: Include attributes in output
+
+    Returns:
+        List of meshes (one per connected component)
     """
-    Parse a DXF file and return one mesh per connected component.
+    mesh_data = parse_dxf_fast(dxf_file)
+    points = mesh_data["points"]
+    faces = mesh_data["faces"]
+    labels = mesh_data["labels"]
 
-    Parameters
-    ----------
-    dxf_file : str
-        Path to ASCII DXF file.
-    decimals : int
-        Decimal places for vertex equality (default: 6).
-    repair : bool
-        Attempt repair on non-manifold components (default: True).
-    min_face_count : int
-        Discard components with fewer triangles (default: 4).
-    logger : Optional[logging.Logger]
-        Logger instance (default: None).
-    use_rust : bool
-        Use fast Rust parser (default: True).
-    use_pyvista : bool
-        Return PyVista PolyData if available (default: True).
-        If False, returns dict representation.
-    attributes : dict, optional
-        Cell attributes to attach to meshes.
+    meshes = []
+    for component_id in range(labels.max() + 1):
+        component_mask = labels == component_id
+        attributes = None if not with_attributes else {}
 
-    Returns
-    -------
-    list of pyvista.PolyData or list of dict
-        One mesh per connected component, sorted by descending face count.
+        mesh = _extract_component(component_mask, points, faces, attributes)
 
-    Examples
-    --------
-    >>> meshes = dxf_to_manifold_meshes("model.dxf", decimals=6, repair=True)
-    >>> print(f"Found {len(meshes)} components")
-    >>> for i, mesh in enumerate(meshes):
-    ...     print(f"  Component {i}: {mesh.n_faces} faces")
-    """
-    if use_rust:
-        raw = parse_dxf_fast(dxf_file, decimals)
-    else:
-        raise ValueError("Pure Python fallback not available; use use_rust=True")
-
-    if logger is not None:
-        logger.info(f"Found {raw.n_components} connected components")
-
-    meshes: list = []
-
-    for comp_id in range(raw.n_components):
-        mask: NDArray[np.bool_] = raw.labels == comp_id
-
-        if mask.sum() < min_face_count:
-            if logger is not None:
-                logger.warning(f"Skipping component #{comp_id}: too few faces ({mask.sum()})")
-            continue
-
-        poly = _extract_component(raw.points, raw.faces, mask, attributes)
-
-        # Post-processing (repair, manifold check)
-        if HAS_PYVISTA and use_pyvista and isinstance(poly, pv.PolyData):
-            if not poly.is_manifold and repair:
-                if logger is not None:
-                    logger.info(f"Repairing non-manifold component #{comp_id}")
-                try:
-                    import pymeshfix
-                    mf = pymeshfix.MeshFix(poly)
-                    mf.repair()
-                    poly = mf.mesh
-                except ImportError:
-                    if logger is not None:
-                        logger.warning("pymeshfix not installed; skipping repair")
-
-        meshes.append(poly)
-
-    # Sort by face count (descending)
-    if isinstance(meshes[0], dict):
-        meshes.sort(key=lambda m: m["n_faces"], reverse=True)
-    else:
-        meshes.sort(key=lambda m: m.n_faces, reverse=True)
+        # Convert to MeshWithAttributes if needed
+        if isinstance(mesh, dict):
+            mesh_obj = MeshWithAttributes(
+                mesh["points"],
+                mesh["faces"],
+                labels[component_mask],
+                point_data=mesh.get("attributes", {}),  # type: ignore[arg-type]
+            )
+            if HAS_PYVISTA and use_pyvista:
+                meshes.append(mesh_obj.to_pyvista())
+            else:
+                meshes.append(mesh_obj)
+        else:
+            meshes.append(mesh)
 
     return meshes
 
 
-# ============================================================================
-# Attribute Support
-# ============================================================================
-
-
-class MeshWithAttributes:
-    """Mesh with support for point and cell data (like PyVista)."""
-
-    def __init__(self, points: NDArrayFloat, faces: NDArray[np.intp]):
-        self.points = points
-        self.faces = faces
-        self.point_data: dict = {}
-        self.cell_data: dict = {}
-
-    def add_point_data(self, name: str, data: np.ndarray) -> None:
-        """Add data per point."""
-        assert len(data) == len(self.points), "Data length must match points"
-        self.point_data[name] = data
-
-    def add_cell_data(self, name: str, data: np.ndarray) -> None:
-        """Add data per cell (triangle)."""
-        n_faces = self.faces.shape[0]
-        assert len(data) == n_faces, "Data length must match faces"
-        self.cell_data[name] = data
-
-    def to_pyvista(self) -> pv.PolyData:
-        """Convert to PyVista PolyData."""
-        if not HAS_PYVISTA:
-            raise ImportError("PyVista required")
-
-        n_tri = self.faces.shape[0]
-        pv_faces = np.empty((n_tri, 4), dtype=np.int32)
-        pv_faces[:, 0] = 3
-        pv_faces[:, 1:] = self.faces
-
-        poly = pv.PolyData(self.points, pv_faces.ravel())
-
-        for name, data in self.point_data.items():
-            poly.point_data[name] = data
-
-        for name, data in self.cell_data.items():
-            poly.cell_data[name] = data
-
-        return poly
+__all__ = [
+    "dxf_to_manifold_meshes",
+    "parse_dxf_fast",
+    "write_dxf_fast",
+    "MeshWithAttributes",
+    "diagnose_mesh",
+]
