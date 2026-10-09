@@ -2,7 +2,7 @@ include README.rst
 include LICENSE
 include Makefile
 recursive-include src *.rs
-recursive-include python *.py
+recursive-include python *.py *.pyi py.typed
 recursive-include tests *.py
 recursive-include examples *.py
 recursive-include .github/workflows *.yml

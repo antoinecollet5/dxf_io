@@ -3,121 +3,145 @@ use numpy::{IntoPyArray, PyArray1, PyArray2};
 use pyo3::prelude::*;
 use rustc_hash::FxHashMap;
 
-const TOLERANCE: f64 = 1e-9;
+type Vertex = [f64; 3];
 
-#[inline]
-fn is_close(a: &[f64; 3], b: &[f64; 3], tol: f64) -> bool {
-    (a[0] - b[0]).abs() < tol && (a[1] - b[1]).abs() < tol && (a[2] - b[2]).abs() < tol
+/// Entity currently being read from the DXF stream.
+#[derive(Clone, Copy, PartialEq)]
+enum Kind {
+    Solid,
+    Face3d,
 }
 
-#[inline]
-fn float_to_bits(f: f64) -> u64 {
-    f.to_bits()
+/// Accumulates the (up to) four corners of a SOLID / 3DFACE entity.
+struct Entity {
+    kind: Kind,
+    corners: [Vertex; 4],
+    has_fourth: bool,
 }
 
-fn parse_dxf(content: &str) -> (Vec<[f64; 3]>, Vec<[usize; 3]>) {
-    let mut points = Vec::new();
-    let mut faces = Vec::new();
-    let mut vertices = Vec::new();
-    let mut in_solid = false;
-    let mut lines = content.lines().peekable();
-
-    while let Some(line) = lines.next() {
-        match line.trim() {
-            "SOLID" => in_solid = true,
-            "ENDSOL" => {
-                in_solid = false;
-                if !vertices.is_empty() {
-                    let is_triangle = is_close(&vertices[3], &vertices[2], TOLERANCE)
-                        || is_close(&vertices[3], &vertices[0], TOLERANCE);
-
-                    if vertices.len() >= 3 {
-                        for i in 0..(if is_triangle { 3 } else { 4 }) {
-                            let mut found = false;
-                            for (j, &existing) in points.iter().enumerate() {
-                                if is_close(&vertices[i], &existing, TOLERANCE) {
-                                    vertices[i] = existing;
-                                    faces.push(j);
-                                    found = true;
-                                    break;
-                                }
-                            }
-                            if !found {
-                                points.push(vertices[i]);
-                                faces.push(points.len() - 1);
-                            }
-                        }
-                    }
-                    vertices.clear();
-                }
-            }
-            code if in_solid => {
-                if let Ok(code_num) = code.parse::<usize>() {
-                    if code_num == 10 || code_num == 20 || code_num == 30 {
-                        if let Some(val_line) = lines.next() {
-                            if let Ok(val) = val_line.trim().parse::<f64>() {
-                                match code_num {
-                                    10 => vertices.push([val, 0.0, 0.0]),
-                                    20 => {
-                                        if !vertices.is_empty() {
-                                            vertices.last_mut().unwrap()[1] = val;
-                                        }
-                                    }
-                                    30 => {
-                                        if !vertices.is_empty() {
-                                            vertices.last_mut().unwrap()[2] = val;
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            _ => {}
+impl Entity {
+    fn new(kind: Kind) -> Self {
+        Entity {
+            kind,
+            corners: [[0.0; 3]; 4],
+            has_fourth: false,
         }
     }
 
-    let faces_vec: Vec<[usize; 3]> = faces
-        .chunks_exact(3)
-        .map(|chunk| [chunk[0], chunk[1], chunk[2]])
-        .collect();
-
-    (points, faces_vec)
+    /// Triangles (as corner indices) describing the entity.
+    ///
+    /// For SOLID the corners are stored in "zig-zag" order (0, 1, 3, 2 around the
+    /// perimeter), whereas 3DFACE stores them in perimeter order.
+    fn triangles(&self) -> Vec<[usize; 3]> {
+        let perimeter: [usize; 4] = match self.kind {
+            Kind::Solid => [0, 1, 3, 2],
+            Kind::Face3d => [0, 1, 2, 3],
+        };
+        let c = &self.corners;
+        // A missing or repeated 4th corner means the entity is a triangle.
+        if !self.has_fourth || c[3] == c[2] {
+            return vec![[0, 1, 2]];
+        }
+        let [a, b, cc, d] = perimeter;
+        vec![[a, b, cc], [a, cc, d]]
+    }
 }
 
-fn deduplicate_points(
-    points: &[[f64; 3]],
-    faces: &[[usize; 3]],
-) -> (Vec<[f64; 3]>, Vec<[usize; 3]>) {
-    let mut unique_points = Vec::new();
-    let mut point_map = FxHashMap::default();
-    let mut new_faces = Vec::new();
+struct Builder {
+    points: Vec<Vertex>,
+    faces: Vec<[usize; 3]>,
+    index: FxHashMap<[i64; 3], usize>,
+    scale: f64,
+}
 
-    for &vertex_idx_array in faces {
-        let mut face_indices = [0, 0, 0];
-        for (i, &vertex_idx) in vertex_idx_array.iter().enumerate() {
-            if (vertex_idx as usize) < points.len() {
-                let point = points[vertex_idx as usize];
-                let bits = float_to_bits(point[0]) ^ float_to_bits(point[1]) ^ float_to_bits(point[2]);
-
-                let new_idx = if let Some(&idx) = point_map.get(&bits) {
-                    idx
-                } else {
-                    unique_points.push(point);
-                    let idx = unique_points.len() - 1;
-                    point_map.insert(bits, idx);
-                    idx
-                };
-
-                face_indices[i] = new_idx;
-            }
+impl Builder {
+    fn new(decimals: i32) -> Self {
+        Builder {
+            points: Vec::new(),
+            faces: Vec::new(),
+            index: FxHashMap::default(),
+            scale: 10f64.powi(decimals),
         }
-        new_faces.push(face_indices);
     }
 
-    (unique_points, new_faces)
+    fn vertex_id(&mut self, v: Vertex) -> usize {
+        let key = [
+            (v[0] * self.scale).round() as i64,
+            (v[1] * self.scale).round() as i64,
+            (v[2] * self.scale).round() as i64,
+        ];
+        if let Some(&idx) = self.index.get(&key) {
+            return idx;
+        }
+        let idx = self.points.len();
+        self.points.push(v);
+        self.index.insert(key, idx);
+        idx
+    }
+
+    fn push_entity(&mut self, entity: &Entity) {
+        for tri in entity.triangles() {
+            let ids = [
+                self.vertex_id(entity.corners[tri[0]]),
+                self.vertex_id(entity.corners[tri[1]]),
+                self.vertex_id(entity.corners[tri[2]]),
+            ];
+            // Skip degenerate triangles (repeated vertices).
+            if ids[0] != ids[1] && ids[1] != ids[2] && ids[0] != ids[2] {
+                self.faces.push(ids);
+            }
+        }
+    }
+}
+
+/// Parse SOLID and 3DFACE entities from ASCII DXF content.
+///
+/// Vertices are merged when they are equal after rounding to `decimals` places.
+fn parse_dxf(content: &str, decimals: i32) -> (Vec<Vertex>, Vec<[usize; 3]>) {
+    let mut builder = Builder::new(decimals);
+    let mut current: Option<Entity> = None;
+    let mut lines = content.lines();
+
+    while let (Some(code_line), Some(value_line)) = (lines.next(), lines.next()) {
+        let Ok(code) = code_line.trim().parse::<i32>() else {
+            continue;
+        };
+        let value = value_line.trim();
+
+        if code == 0 {
+            if let Some(entity) = current.take() {
+                builder.push_entity(&entity);
+            }
+            current = match value {
+                "SOLID" => Some(Entity::new(Kind::Solid)),
+                "3DFACE" => Some(Entity::new(Kind::Face3d)),
+                _ => None,
+            };
+            continue;
+        }
+
+        let Some(entity) = current.as_mut() else {
+            continue;
+        };
+        // Group codes 10-13 / 20-23 / 30-33 are the x / y / z of corners 0-3.
+        let (axis, corner) = match code {
+            10..=13 => (0, (code - 10) as usize),
+            20..=23 => (1, (code - 20) as usize),
+            30..=33 => (2, (code - 30) as usize),
+            _ => continue,
+        };
+        if let Ok(val) = value.parse::<f64>() {
+            entity.corners[corner][axis] = val;
+            if corner == 3 {
+                entity.has_fourth = true;
+            }
+        }
+    }
+    if let Some(entity) = current.take() {
+        builder.push_entity(&entity);
+    }
+
+    (builder.points, builder.faces)
 }
 
 struct UnionFind {
@@ -156,9 +180,12 @@ impl UnionFind {
     }
 }
 
-fn extract_components(faces: &[[usize; 3]]) -> Vec<usize> {
-    let max_vertex = faces.iter().flat_map(|f| f.iter()).max().copied().unwrap_or(0);
-    let mut uf = UnionFind::new(max_vertex + 1);
+fn extract_components(n_points: usize, faces: &[[usize; 3]]) -> Vec<usize> {
+    if n_points == 0 {
+        return Vec::new();
+    }
+    let max_vertex = n_points - 1;
+    let mut uf = UnionFind::new(n_points);
 
     for &face in faces {
         uf.union(face[0], face[1]);
@@ -181,18 +208,18 @@ fn extract_components(faces: &[[usize; 3]]) -> Vec<usize> {
     labels
 }
 
-fn write_dxf_face(vertices: &[[f64; 3]; 3], face_id: usize) -> String {
+fn write_dxf_face(vertices: &[Vertex; 3], face_id: usize) -> String {
     let mut dxf_data = String::new();
     dxf_data.push_str("  0\n3DFACE\n");
     dxf_data.push_str("  8\n0\n");
     dxf_data.push_str(&format!(" 62\n{}\n", face_id % 255 + 1));
 
-    // Write all three vertices of the triangle
-    for i in 0..3 {
-        let code = 10 + i * 10;
-        dxf_data.push_str(&format!(" {}\n{:.6}\n", code, vertices[i][0]));
-        dxf_data.push_str(&format!(" {}\n{:.6}\n", code + 20, vertices[i][1]));
-        dxf_data.push_str(&format!(" {}\n{:.6}\n", code + 30, vertices[i][2]));
+    // A 3DFACE always has four corners; a triangle repeats the third one.
+    for i in 0..4 {
+        let v = vertices[i.min(2)];
+        dxf_data.push_str(&format!(" {}\n{:.6}\n", 10 + i, v[0]));
+        dxf_data.push_str(&format!(" {}\n{:.6}\n", 20 + i, v[1]));
+        dxf_data.push_str(&format!(" {}\n{:.6}\n", 30 + i, v[2]));
     }
 
     dxf_data
@@ -252,7 +279,7 @@ impl RawMesh {
 
     #[getter]
     fn n_components(&self) -> usize {
-        self.labels.iter().max().copied().unwrap_or(0) + 1
+        self.labels.iter().max().map_or(0, |m| m + 1)
     }
 
     fn points_array<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<f64>> {
@@ -283,14 +310,14 @@ impl RawMesh {
 }
 
 #[pyfunction]
-fn parse_dxf_fast(dxf_content: &str) -> PyResult<RawMesh> {
-    let (points, faces) = parse_dxf(dxf_content);
-    let (dedup_points, dedup_faces) = deduplicate_points(&points, &faces);
-    let labels = extract_components(&dedup_faces);
+#[pyo3(signature = (dxf_content, decimals = 6))]
+fn parse_dxf_fast(dxf_content: &str, decimals: i32) -> PyResult<RawMesh> {
+    let (points, faces) = parse_dxf(dxf_content, decimals);
+    let labels = extract_components(points.len(), &faces);
 
     Ok(RawMesh {
-        points: dedup_points,
-        faces: dedup_faces,
+        points,
+        faces,
         labels,
     })
 }
@@ -301,7 +328,7 @@ fn write_dxf_fast(points: Vec<[f64; 3]>, faces: Vec<[usize; 3]>) -> PyResult<Str
 }
 
 #[pymodule]
-fn dxf_io(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn _dxf_io(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(parse_dxf_fast, m)?)?;
     m.add_function(wrap_pyfunction!(write_dxf_fast, m)?)?;
     m.add_class::<RawMesh>()?;

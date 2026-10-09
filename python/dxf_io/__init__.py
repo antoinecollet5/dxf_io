@@ -12,16 +12,22 @@ Basic Usage:
     ...     print(f"Component {i}: {mesh.n_faces} faces")
 """
 
-from .dxf_io import (
+from ._core import (
     MeshWithAttributes,
+    diagnose_mesh,
     dxf_to_manifold_meshes,
+    from_manifold3d,
     parse_dxf_fast,
+    to_manifold3d,
     write_dxf_fast,
 )
 
 __version__ = "0.1.0"
 __all__ = [
+    "diagnose_mesh",
     "dxf_to_manifold_meshes",
+    "from_manifold3d",
+    "to_manifold3d",
     "parse_dxf_fast",
     "write_dxf_fast",
     "MeshWithAttributes",

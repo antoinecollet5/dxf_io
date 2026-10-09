@@ -1,5 +1,5 @@
 [build-system]
-requires = ["maturin>=0.14,<0.15"]
+requires = ["maturin>=1.5,<2"]
 build-backend = "maturin"
 
 [project]
@@ -44,7 +44,7 @@ manifold = [
     "manifold3d>=3.0.0",
 ]
 examples = ["marimo"]
-dev = ["maturin>=0.14", "setuptools-rust"]
+dev = ["maturin>=1.5"]
 docs = [
     "sphinx<9",
     "pydata-sphinx-theme",
@@ -74,25 +74,12 @@ Changelog = "https://github.com/antoinecollet5/dxf_io/releases"
 
 [tool.maturin]
 python-source = "python"
-module-name = "dxf_io"
+module-name = "dxf_io._dxf_io"
 features = ["pyo3/extension-module"]
 
 [tool.ruff]
 src = ["python", "tests"]
 line-length = 100
-
-[tool.ruff.lint]
-select = [
-    "F",    # Pyflakes
-    "E",    # pycodestyle errors
-    "W",    # pycodestyle warnings
-    "I",    # isort
-]
-fixable = ["A", "B", "C", "D", "E", "F", "I"]
-unfixable = []
-
-[tool.ruff.lint.isort]
-known-first-party = ["dxf_io"]
 
 exclude = [
     ".bzr",
@@ -117,8 +104,26 @@ exclude = [
     "venv",
 ]
 
+[tool.ruff.lint]
+select = [
+    "F",    # Pyflakes
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "I",    # isort
+]
+fixable = ["A", "B", "C", "D", "E", "F", "I"]
+unfixable = []
+
+[tool.ruff.lint.isort]
+known-first-party = ["dxf_io"]
+
+
 [tool.ty.src]
 include = ["python", "tests"]
+
+[tool.ty.analysis]
+# Optional dependency, imported lazily.
+allowed-unresolved-imports = ["manifold3d"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

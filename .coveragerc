@@ -1,6 +1,7 @@
 [run]
 branch = True
 source = dxf_io
+relative_files = True
 
 [report]
 exclude_lines =
@@ -12,7 +13,11 @@ exclude_lines =
     if TYPE_CHECKING:
 
 [paths]
+# Map the files measured on each runner (editable install -> repository checkout,
+# regular install -> site-packages, any OS) onto the sources of the merge job.
 source =
-    python
+    python/dxf_io
+    */python/dxf_io
+    *\python\dxf_io
     */site-packages/dxf_io
     *\site-packages\dxf_io

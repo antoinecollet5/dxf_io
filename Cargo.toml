@@ -7,14 +7,8 @@ edition = "2021"
 pyo3 = { version = "0.29", features = ["extension-module"] }
 numpy = "0.29"
 ndarray = "0.16"
-rayon = "1.10"
-hashbrown = "0.14"
-smallvec = "1.13"
-regex = "1.10"
 rustc-hash = "2.1"
 
-[build-dependencies]
-pyo3-build-config = "0.23"
 
 [profile.release]
 opt-level = 3
@@ -22,5 +16,5 @@ lto = true
 codegen-units = 1
 
 [lib]
-name = "dxf_io"
+name = "_dxf_io"
 crate-type = ["cdylib"]
