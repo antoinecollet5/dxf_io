@@ -7,7 +7,7 @@ connected-component extraction, and optional PyVista / manifold3d conversion.
 from __future__ import annotations
 
 import os
-from typing import TYPE_CHECKING, Any, Optional, Union
+from typing import TYPE_CHECKING, Any, Optional, Union, overload
 
 import numpy as np
 
@@ -31,7 +31,8 @@ def parse_dxf_fast(
     """Parse the SOLID and 3DFACE entities of an ASCII DXF file.
 
     Quads are split into two triangles, and vertices that are equal once rounded to
-    ``decimals`` places are merged.
+    ``decimals`` places are merged. Files are read and parsed in Rust, using all the
+    available cores, without holding the GIL.
 
     Parameters
     ----------
@@ -47,24 +48,27 @@ def parse_dxf_fast(
         the connected-component id of each point.
     """
     if isinstance(dxf_file, str) and "\n" in dxf_file:
-        content = dxf_file
+        points, faces, labels = _rs.parse_dxf_bytes(dxf_file.encode("utf-8"), decimals)
     else:
-        with open(os.fspath(dxf_file), encoding="utf-8", errors="replace") as f:
-            content = f.read()
-
-    raw = _rs.parse_dxf_fast(content, decimals)
+        points, faces, labels = _rs.parse_dxf_file(dxf_file, decimals)
     return {
-        "points": raw.points_array().astype(np.float64),
-        "faces": raw.faces_array().astype(np.intp),
-        "labels": raw.labels_array().astype(np.intp),
+        "points": points,
+        "faces": faces.astype(np.intp, copy=False),
+        "labels": labels.astype(np.intp, copy=False),
     }
 
 
+@overload
+def write_dxf_fast(points: np.ndarray, faces: np.ndarray, output_file: None = None) -> str: ...
+@overload
+def write_dxf_fast(
+    points: np.ndarray, faces: np.ndarray, output_file: Union[str, "os.PathLike[str]"]
+) -> None: ...
 def write_dxf_fast(
     points: np.ndarray,
     faces: np.ndarray,
     output_file: Optional[Union[str, "os.PathLike[str]"]] = None,
-) -> str:
+) -> Optional[str]:
     """Write a triangle mesh as 3DFACE entities.
 
     Parameters
@@ -74,21 +78,27 @@ def write_dxf_fast(
     faces : numpy.ndarray
         (M, 3) vertex indices.
     output_file : str or path-like, optional
-        If given, the DXF content is also written to this file.
+        If given, the DXF is streamed to this file and nothing is returned. This avoids
+        building the whole document in memory.
 
     Returns
     -------
-    str
-        The DXF content.
+    str or None
+        The DXF content if ``output_file`` is None, otherwise None.
+
+    Raises
+    ------
+    ValueError
+        If the arrays do not have shape (N, 3) or a face index is out of range.
     """
-    content = _rs.write_dxf_fast(
-        np.asarray(points, dtype=np.float64).tolist(),
-        np.asarray(faces, dtype=np.intp).tolist(),
-    )
-    if output_file is not None:
-        with open(os.fspath(output_file), "w", encoding="utf-8") as f:
-            f.write(content)
-    return content
+    pts = np.ascontiguousarray(points, dtype=np.float64)
+    fcs = np.ascontiguousarray(faces, dtype=np.int64)
+    if pts.ndim != 2 or fcs.ndim != 2:
+        raise ValueError("points and faces must be 2D arrays of shape (N, 3)")
+    if output_file is None:
+        return _rs.write_dxf_string(pts, fcs)
+    _rs.write_dxf_file(output_file, pts, fcs)
+    return None
 
 
 class MeshWithAttributes:
@@ -127,9 +137,13 @@ class MeshWithAttributes:
         """Number of connected components."""
         return int(np.max(self.labels)) + 1 if len(self.labels) else 0
 
-    def to_dxf(self, output_file: Optional[Union[str, "os.PathLike[str]"]] = None) -> str:
-        """Export to DXF (3DFACE entities)."""
-        return write_dxf_fast(self.points, self.faces, output_file)
+    @overload
+    def to_dxf(self, output_file: None = None) -> str: ...
+    @overload
+    def to_dxf(self, output_file: Union[str, "os.PathLike[str]"]) -> None: ...
+    def to_dxf(self, output_file: Optional[Union[str, "os.PathLike[str]"]] = None) -> Optional[str]:
+        """Export to DXF (3DFACE entities). See :func:`write_dxf_fast`."""
+        return write_dxf_fast(self.points, self.faces, output_file)  # type: ignore[call-overload]
 
     def to_pyvista(self) -> "pv.PolyData":
         """Convert to a :class:`pyvista.PolyData` (requires PyVista)."""

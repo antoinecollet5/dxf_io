@@ -1,0 +1,1472 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 31a0ac6..719ec51 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -8,16 +8,56 @@ version = "1.5.1"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
+ 
++[[package]]
++name = "crossbeam-deque"
++version = "0.8.8"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "622f3fc73690be383c7214310406f28a90e6edeadc3cea882f9d71e495b9711a"
++dependencies = [
++ "crossbeam-epoch",
++ "crossbeam-utils",
++]
++
++[[package]]
++name = "crossbeam-epoch"
++version = "0.9.21"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "dc74980687109a3b14c72fd458107bf0baa1da1a1a805e178d15501ba9b86d9d"
++dependencies = [
++ "crossbeam-utils",
++]
++
++[[package]]
++name = "crossbeam-utils"
++version = "0.8.23"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "a31eee39dddec8330830986fcd7625edb5a24ec90ea038215273bbc3adb08ac6"
++
+ [[package]]
+ name = "dxf_io"
+ version = "0.1.0"
+ dependencies = [
++ "fast-float2",
++ "memchr",
+  "ndarray",
+  "numpy",
+  "pyo3",
++ "rayon",
+  "rustc-hash",
+ ]
+ 
++[[package]]
++name = "either"
++version = "1.19.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "0e9c71c2167ca323c882b99918929403426e2373ea17242ff5653e0d5e1058be"
++
++[[package]]
++name = "fast-float2"
++version = "0.2.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "c6e8948ce679d00a02a94739ea185595dca7118ed04feb991127e443bd3d761f"
++
+ [[package]]
+ name = "heck"
+ version = "0.5.0"
+@@ -40,6 +80,12 @@ dependencies = [
+  "rawpointer",
+ ]
+ 
++[[package]]
++name = "memchr"
++version = "2.8.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
++
+ [[package]]
+ name = "ndarray"
+ version = "0.16.1"
+@@ -200,6 +246,26 @@ version = "0.2.1"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "60a357793950651c4ed0f3f52338f53b2f809f32d83a07f72909fa13e4c6c1e3"
+ 
++[[package]]
++name = "rayon"
++version = "1.12.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "fb39b166781f92d482534ef4b4b1b2568f42613b53e5b6c160e24cfbfa30926d"
++dependencies = [
++ "either",
++ "rayon-core",
++]
++
++[[package]]
++name = "rayon-core"
++version = "1.13.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "22e18b0f0062d30d4230b2e85ff77fdfe4326feb054b9783a3460d8435c8ab91"
++dependencies = [
++ "crossbeam-deque",
++ "crossbeam-utils",
++]
++
+ [[package]]
+ name = "rustc-hash"
+ version = "2.1.3"
+diff --git a/Cargo.toml b/Cargo.toml
+index 7d9d27d..a715977 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -8,6 +8,9 @@ pyo3 = { version = "0.29", features = ["extension-module"] }
+ numpy = "0.29"
+ ndarray = "0.16"
+ rustc-hash = "2.1"
++rayon = "1.10"
++memchr = "2.7"
++fast-float2 = "0.2"
+ 
+ 
+ [profile.release]
+diff --git a/README.rst b/README.rst
+index 0956df1..4766d15 100644
+--- a/README.rst
++++ b/README.rst
+@@ -9,6 +9,19 @@ dxf_io
+ **The complete documentation can be found here**: `GitHub Repository <https://github.com/antoinecollet5/dxf_io>`_.
+ 
+ 
++===============
++⚡ Performance
++===============
++
++Parsing and writing run in Rust, use all the available cores and release the GIL.
++On a 190 MB file (4 million vertices, 2 million triangles), parsing takes under a second
++and writing about one second on a 2-core machine. On a 16 MB file, ``dxf_io`` is about
++100x faster than `ezdxf <https://ezdxf.mozman.at>`_ at merely reading and iterating the
++faces (and it also merges the vertices and finds the connected components).
++
++Reproduce with ``python benchmark.py --synthetic 150 --ezdxf`` after
++``maturin develop --release``.
++
+ ===========
+ 🔑 License
+ ===========
+diff --git a/benchmark.py b/benchmark.py
+index 280e4ae..e4f20e3 100644
+--- a/benchmark.py
++++ b/benchmark.py
+@@ -1,135 +1,104 @@
+ #!/usr/bin/env python3
+-"""
+-Benchmark: Pure Python vs. Rust + PyO3
++"""Time every stage of dxf_io on a DXF file (or on a synthetic one).
++
++Usage::
+ 
+-Compares performance of dxf_io.py (pure Python) vs.
+-dxf_io_wrapper.py (Rust + PyO3 bindings).
++    python benchmark.py model.dxf
++    python benchmark.py --synthetic 500          # 4 grids of 500 x 500 quads (~190 MB)
++    python benchmark.py model.dxf --ezdxf        # also time ezdxf (pip install ezdxf)
+ 
+-Run with:
+-    python benchmark.py <path_to_dxf_file>
++Build the extension in release mode first: ``maturin develop --release``.
+ """
+ 
+-import sys
++from __future__ import annotations
++
++import argparse
++import tempfile
+ import time
++from collections.abc import Callable
+ from pathlib import Path
+-from typing import Tuple
+-
+-import numpy as np
+-
+-
+-def bench_parse(func, dxf_file: str, decimals: int = 6, n_runs: int = 3) -> Tuple[float, dict]:
+-    """Run parser n times, return median time and result."""
+-    times = []
+-    result = None
+-
+-    for i in range(n_runs):
++from typing import Any
++
++from dxf_io import dxf_to_manifold_meshes, parse_dxf_fast, write_dxf_fast
++
++
++def make_synthetic(n: int, path: Path, parts: int = 4) -> None:
++    """Write ``parts`` disjoint n x n grids of 3DFACE quads."""
++    with open(path, "w", encoding="utf-8") as f:
++        f.write("  0\nSECTION\n  2\nENTITIES\n")
++        for part in range(parts):
++            off = part * (n + 5)
++            for i in range(n):
++                for j in range(n):
++                    x, y, z = off + i * 0.5, j * 0.5, 0.1 * part
++                    corners = [(x, y), (x + 0.5, y), (x + 0.5, y + 0.5), (x, y + 0.5)]
++                    f.write("  0\n3DFACE\n  8\n0\n")
++                    for k, (cx, cy) in enumerate(corners):
++                        f.write(f" {10 + k}\n{cx:.6f}\n {20 + k}\n{cy:.6f}\n {30 + k}\n{z:.6f}\n")
++        f.write("  0\nENDSEC\n  0\nEOF\n")
++
++
++def timed(
++    label: str, func: Callable[..., Any], *args: Any, repeat: int = 3, **kwargs: Any
++) -> tuple[float, Any]:
++    """Run ``func`` ``repeat`` times, print the best time and return ``(best, result)``."""
++    best, result = float("inf"), None
++    for _ in range(repeat):
+         t0 = time.perf_counter()
+-        result = func(dxf_file, decimals)
+-        t1 = time.perf_counter()
+-        times.append(t1 - t0)
+-        print(f"  Run {i + 1}/{n_runs}: {times[-1]:.3f}s", flush=True)
+-
+-    times.sort()
+-    median_time = times[n_runs // 2]
+-
+-    stats = {
+-        "min": min(times),
+-        "median": median_time,
+-        "max": max(times),
+-        "mean": np.mean(times),
+-        "n_points": int(result.points.shape[0]) if hasattr(result, "points") else None,
+-        "n_faces": int(result.faces.shape[0]) if hasattr(result, "faces") else None,
+-        "n_components": int(result.n_components) if hasattr(result, "n_components") else None,
+-    }
+-    return median_time, stats
+-
+-
+-def main():
+-    if len(sys.argv) < 2:
+-        print("Usage: python benchmark.py <dxf_file>")
+-        print("Example: python benchmark.py model.dxf")
+-        sys.exit(1)
+-
+-    dxf_file = sys.argv[1]
+-    if not Path(dxf_file).exists():
+-        print(f"Error: File not found: {dxf_file}")
+-        sys.exit(1)
+-
+-    file_size_mb = Path(dxf_file).stat().st_size / (1024 * 1024)
+-    print(f"Benchmarking: {dxf_file} ({file_size_mb:.1f} MB)\n")
+-
+-    # Test 1: Import and benchmark Rust version
+-    print("=" * 60)
+-    print("RUST + PyO3 (dxf_io_wrapper)")
+-    print("=" * 60)
+-    try:
+-        from dxf_io import parse_dxf_fast as rust_parse
+-
+-        print("Parsing (3 runs)...")
+-        rust_time, rust_stats = bench_parse(rust_parse, dxf_file, n_runs=3)
+-
+-        print("\nResults:")
+-        print(f"  Points: {rust_stats['n_points']}")
+-        print(f"  Faces: {rust_stats['n_faces']}")
+-        print(f"  Components: {rust_stats['n_components']}")
++        result = func(*args, **kwargs)
++        best = min(best, time.perf_counter() - t0)
++    print(f"  {label:<34s} {best:8.3f} s")
++    return best, result
++
++
++def bench_ezdxf(path: Path) -> float:
++    """Time ezdxf reading the file and iterating over its faces (no vertex merging)."""
++    import ezdxf
++
++    t0 = time.perf_counter()
++    msp = ezdxf.readfile(str(path)).modelspace()
++    faces: Any = msp.query("3DFACE SOLID")
++    for entity in faces:
++        entity.wcs_vertices()
++    return time.perf_counter() - t0
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser(
++        description=__doc__, formatter_class=argparse.RawTextHelpFormatter
++    )
++    parser.add_argument("dxf_file", nargs="?", type=Path, help="DXF file to benchmark")
++    parser.add_argument("--synthetic", type=int, metavar="N", help="generate N x N grids instead")
++    parser.add_argument("--ezdxf", action="store_true", help="also time ezdxf (slow on big files)")
++    args = parser.parse_args()
++
++    with tempfile.TemporaryDirectory() as tmp:
++        if args.synthetic:
++            path = Path(tmp) / "synthetic.dxf"
++            print(f"Generating a synthetic file ({args.synthetic} x {args.synthetic} x 4 quads)...")
++            make_synthetic(args.synthetic, path)
++        elif args.dxf_file is not None and args.dxf_file.exists():
++            path = args.dxf_file
++        else:
++            parser.error("give an existing DXF file, or --synthetic N")
++
++        print(f"\n{path.name}: {path.stat().st_size / 1e6:.1f} MB\n")
++        _, data = timed("parse_dxf_fast", parse_dxf_fast, path)
++        n_comp = int(data["labels"].max()) + 1 if len(data["labels"]) else 0
+         print(
+-            f"  Time: {rust_time:.3f}s (min={rust_stats['min']:.3f}, max={rust_stats['max']:.3f})"
++            f"    -> {len(data['points'])} points, {len(data['faces'])} faces, {n_comp} components"
+         )
+-
+-    except ImportError as e:
+-        print(f"⚠️  Rust version not available: {e}")
+-        print("   Run: maturin develop -r\n")
+-        rust_time = None
+-        rust_stats = None
+-
+-    # Test 2: Import and benchmark pure Python version
+-    print("\n" + "=" * 60)
+-    print("PURE PYTHON (dxf_io.dxf_to_manifold_meshes)")
+-    print("=" * 60)
+-    try:
+-        from dxf_io import dxf_to_manifold_meshes as python_parse
+-
+-        print("Parsing (1 run, may be slow)...")
+-
+-        t0 = time.perf_counter()
+-        py_meshes = python_parse(dxf_file, decimals=6)
+-        python_time = time.perf_counter() - t0
+-
+-        py_n_points = sum(m.n_points for m in py_meshes)
+-        py_n_faces = sum(m.n_faces for m in py_meshes)
+-
+-        print("\nResults:")
+-        print(f"  Points: {py_n_points}")
+-        print(f"  Faces: {py_n_faces}")
+-        print(f"  Components: {len(py_meshes)}")
+-        print(f"  Time: {python_time:.3f}s")
+-
+-    except ImportError as e:
+-        print(f"⚠️  Pure Python version not available: {e}")
+-        print("   Ensure dxf_io.py is in PYTHONPATH\n")
+-        python_time = None
+-
+-    # Comparison
+-    print("\n" + "=" * 60)
+-    print("COMPARISON")
+-    print("=" * 60)
+-
+-    if rust_time and python_time:
+-        speedup = python_time / rust_time
+-        print(f"Rust: {rust_time:.3f}s")
+-        print(f"Python: {python_time:.3f}s")
+-        print(f"Speedup: {speedup:.1f}x faster with Rust\n")
+-
+-        if rust_stats and abs(rust_stats["n_faces"] - py_n_faces) > 0:
+-            print(f"⚠️  Face count mismatch: Rust={rust_stats['n_faces']}, Python={py_n_faces}")
+-        else:
+-            print("✅ Results match between implementations")
+-    elif rust_time:
+-        print(f"Rust: {rust_time:.3f}s")
+-        print("(Python version not available for comparison)")
+-    elif python_time:
+-        print(f"Python: {python_time:.3f}s")
+-        print("(Rust version not available for comparison)")
++        timed("dxf_to_manifold_meshes", dxf_to_manifold_meshes, path, use_pyvista=False)
++        timed("write_dxf_fast -> str", write_dxf_fast, data["points"], data["faces"])
++        out = Path(tmp) / "out.dxf"
++        timed("write_dxf_fast -> file", write_dxf_fast, data["points"], data["faces"], out)
++
++        if args.ezdxf:
++            print()
++            t_ezdxf = bench_ezdxf(path)
++            t_dxf_io, _ = timed("parse_dxf_fast (again)", parse_dxf_fast, path)
++            print(f"  {'ezdxf (read + iterate faces)':<34s} {t_ezdxf:8.3f} s")
++            print(f"\n  dxf_io is {t_ezdxf / t_dxf_io:.0f}x faster than ezdxf")
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/pyproject.toml b/pyproject.toml
+index e51f484..3d0baa8 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -122,8 +122,8 @@ known-first-party = ["dxf_io"]
+ include = ["python", "tests"]
+ 
+ [tool.ty.analysis]
+-# Optional dependency, imported lazily.
+-allowed-unresolved-imports = ["manifold3d"]
++# Optional dependencies, imported lazily.
++allowed-unresolved-imports = ["manifold3d", "ezdxf"]
+ 
+ [tool.pytest.ini_options]
+ testpaths = ["tests"]
+diff --git a/python/dxf_io/_core.py b/python/dxf_io/_core.py
+index a09c03e..445f854 100644
+--- a/python/dxf_io/_core.py
++++ b/python/dxf_io/_core.py
+@@ -7,7 +7,7 @@ connected-component extraction, and optional PyVista / manifold3d conversion.
+ from __future__ import annotations
+ 
+ import os
+-from typing import TYPE_CHECKING, Any, Optional, Union
++from typing import TYPE_CHECKING, Any, Optional, Union, overload
+ 
+ import numpy as np
+ 
+@@ -31,7 +31,8 @@ def parse_dxf_fast(
+     """Parse the SOLID and 3DFACE entities of an ASCII DXF file.
+ 
+     Quads are split into two triangles, and vertices that are equal once rounded to
+-    ``decimals`` places are merged.
++    ``decimals`` places are merged. Files are read and parsed in Rust, using all the
++    available cores, without holding the GIL.
+ 
+     Parameters
+     ----------
+@@ -47,24 +48,27 @@ def parse_dxf_fast(
+         the connected-component id of each point.
+     """
+     if isinstance(dxf_file, str) and "\n" in dxf_file:
+-        content = dxf_file
++        points, faces, labels = _rs.parse_dxf_bytes(dxf_file.encode("utf-8"), decimals)
+     else:
+-        with open(os.fspath(dxf_file), encoding="utf-8", errors="replace") as f:
+-            content = f.read()
+-
+-    raw = _rs.parse_dxf_fast(content, decimals)
++        points, faces, labels = _rs.parse_dxf_file(dxf_file, decimals)
+     return {
+-        "points": raw.points_array().astype(np.float64),
+-        "faces": raw.faces_array().astype(np.intp),
+-        "labels": raw.labels_array().astype(np.intp),
++        "points": points,
++        "faces": faces.astype(np.intp, copy=False),
++        "labels": labels.astype(np.intp, copy=False),
+     }
+ 
+ 
++@overload
++def write_dxf_fast(points: np.ndarray, faces: np.ndarray, output_file: None = None) -> str: ...
++@overload
++def write_dxf_fast(
++    points: np.ndarray, faces: np.ndarray, output_file: Union[str, "os.PathLike[str]"]
++) -> None: ...
+ def write_dxf_fast(
+     points: np.ndarray,
+     faces: np.ndarray,
+     output_file: Optional[Union[str, "os.PathLike[str]"]] = None,
+-) -> str:
++) -> Optional[str]:
+     """Write a triangle mesh as 3DFACE entities.
+ 
+     Parameters
+@@ -74,21 +78,27 @@ def write_dxf_fast(
+     faces : numpy.ndarray
+         (M, 3) vertex indices.
+     output_file : str or path-like, optional
+-        If given, the DXF content is also written to this file.
++        If given, the DXF is streamed to this file and nothing is returned. This avoids
++        building the whole document in memory.
+ 
+     Returns
+     -------
+-    str
+-        The DXF content.
++    str or None
++        The DXF content if ``output_file`` is None, otherwise None.
++
++    Raises
++    ------
++    ValueError
++        If the arrays do not have shape (N, 3) or a face index is out of range.
+     """
+-    content = _rs.write_dxf_fast(
+-        np.asarray(points, dtype=np.float64).tolist(),
+-        np.asarray(faces, dtype=np.intp).tolist(),
+-    )
+-    if output_file is not None:
+-        with open(os.fspath(output_file), "w", encoding="utf-8") as f:
+-            f.write(content)
+-    return content
++    pts = np.ascontiguousarray(points, dtype=np.float64)
++    fcs = np.ascontiguousarray(faces, dtype=np.int64)
++    if pts.ndim != 2 or fcs.ndim != 2:
++        raise ValueError("points and faces must be 2D arrays of shape (N, 3)")
++    if output_file is None:
++        return _rs.write_dxf_string(pts, fcs)
++    _rs.write_dxf_file(output_file, pts, fcs)
++    return None
+ 
+ 
+ class MeshWithAttributes:
+@@ -127,9 +137,13 @@ class MeshWithAttributes:
+         """Number of connected components."""
+         return int(np.max(self.labels)) + 1 if len(self.labels) else 0
+ 
+-    def to_dxf(self, output_file: Optional[Union[str, "os.PathLike[str]"]] = None) -> str:
+-        """Export to DXF (3DFACE entities)."""
+-        return write_dxf_fast(self.points, self.faces, output_file)
++    @overload
++    def to_dxf(self, output_file: None = None) -> str: ...
++    @overload
++    def to_dxf(self, output_file: Union[str, "os.PathLike[str]"]) -> None: ...
++    def to_dxf(self, output_file: Optional[Union[str, "os.PathLike[str]"]] = None) -> Optional[str]:
++        """Export to DXF (3DFACE entities). See :func:`write_dxf_fast`."""
++        return write_dxf_fast(self.points, self.faces, output_file)  # type: ignore[call-overload]
+ 
+     def to_pyvista(self) -> "pv.PolyData":
+         """Convert to a :class:`pyvista.PolyData` (requires PyVista)."""
+diff --git a/python/dxf_io/_dxf_io.pyi b/python/dxf_io/_dxf_io.pyi
+index 002fd1a..9e6d9bf 100644
+--- a/python/dxf_io/_dxf_io.pyi
++++ b/python/dxf_io/_dxf_io.pyi
+@@ -1,31 +1,17 @@
+ """Type stubs for the compiled Rust extension ``dxf_io._dxf_io``."""
+ 
++import os
++
+ import numpy as np
+ import numpy.typing as npt
+ 
+-class RawMesh:
+-    """Triangle mesh produced by the Rust parser."""
+-
+-    points: list[list[float]]
+-    faces: list[list[int]]
+-    labels: list[int]
+-
+-    def __init__(
+-        self,
+-        points: list[list[float]],
+-        faces: list[list[int]],
+-        labels: list[int],
+-    ) -> None: ...
+-    @property
+-    def n_points(self) -> int: ...
+-    @property
+-    def n_faces(self) -> int: ...
+-    @property
+-    def n_components(self) -> int: ...
+-    def points_array(self) -> npt.NDArray[np.float64]: ...
+-    def faces_array(self) -> npt.NDArray[np.uint64]: ...
+-    def labels_array(self) -> npt.NDArray[np.uint64]: ...
+-    def to_dxf(self) -> str: ...
+-
+-def parse_dxf_fast(dxf_content: str, decimals: int = 6) -> RawMesh: ...
+-def write_dxf_fast(points: list[list[float]], faces: list[list[int]]) -> str: ...
++def parse_dxf_bytes(
++    data: bytes, decimals: int = 6
++) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.int64], npt.NDArray[np.int64]]: ...
++def parse_dxf_file(
++    path: str | os.PathLike[str], decimals: int = 6
++) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.int64], npt.NDArray[np.int64]]: ...
++def write_dxf_string(points: npt.NDArray[np.float64], faces: npt.NDArray[np.int64]) -> str: ...
++def write_dxf_file(
++    path: str | os.PathLike[str], points: npt.NDArray[np.float64], faces: npt.NDArray[np.int64]
++) -> None: ...
+diff --git a/src/lib.rs b/src/lib.rs
+index 3f8aed8..c020aea 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,18 +1,39 @@
+-use ndarray::{Array1, Array2};
+-use numpy::{IntoPyArray, PyArray1, PyArray2};
++//! Fast SOLID / 3DFACE reader and writer for ASCII DXF files.
++//!
++//! The Python-facing API lives at the bottom of this file; everything above is plain
++//! Rust so that it can be unit-tested without an interpreter.
++
++use std::fs::File;
++use std::io::{self, BufWriter, Write};
++use std::path::PathBuf;
++
++use ndarray::Array2;
++use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray2, PyUntypedArrayMethods};
++use pyo3::exceptions::PyValueError;
+ use pyo3::prelude::*;
++use rayon::prelude::*;
+ use rustc_hash::FxHashMap;
+ 
+ type Vertex = [f64; 3];
+ 
+-/// Entity currently being read from the DXF stream.
++// ---------------------------------------------------------------------------
++// Parsing
++// ---------------------------------------------------------------------------
++
++/// One SOLID / 3DFACE entity, with corners already in perimeter order.
++#[derive(Clone, Copy)]
++struct Quad {
++    corners: [Vertex; 4],
++    /// `true` when the entity is a triangle (4th corner missing or repeated).
++    triangle: bool,
++}
++
+ #[derive(Clone, Copy, PartialEq)]
+ enum Kind {
+     Solid,
+     Face3d,
+ }
+ 
+-/// Accumulates the (up to) four corners of a SOLID / 3DFACE entity.
+ struct Entity {
+     kind: Kind,
+     corners: [Vertex; 4],
+@@ -28,98 +49,110 @@ impl Entity {
+         }
+     }
+ 
+-    /// Triangles (as corner indices) describing the entity.
+-    ///
+-    /// For SOLID the corners are stored in "zig-zag" order (0, 1, 3, 2 around the
+-    /// perimeter), whereas 3DFACE stores them in perimeter order.
+-    fn triangles(&self) -> Vec<[usize; 3]> {
+-        let perimeter: [usize; 4] = match self.kind {
+-            Kind::Solid => [0, 1, 3, 2],
+-            Kind::Face3d => [0, 1, 2, 3],
+-        };
+-        let c = &self.corners;
++    fn finish(mut self) -> Quad {
+         // A missing or repeated 4th corner means the entity is a triangle.
+-        if !self.has_fourth || c[3] == c[2] {
+-            return vec![[0, 1, 2]];
++        let triangle = !self.has_fourth || self.corners[3] == self.corners[2];
++        // SOLID stores the corners of a quad in "zig-zag" order (0, 1, 3, 2 around the
++        // perimeter), whereas 3DFACE stores them in perimeter order.
++        if self.kind == Kind::Solid && !triangle {
++            self.corners.swap(2, 3);
++        }
++        Quad {
++            corners: self.corners,
++            triangle,
+         }
+-        let [a, b, cc, d] = perimeter;
+-        vec![[a, b, cc], [a, cc, d]]
+     }
+ }
+ 
+-struct Builder {
+-    points: Vec<Vertex>,
+-    faces: Vec<[usize; 3]>,
+-    index: FxHashMap<[i64; 3], usize>,
+-    scale: f64,
++/// Iterator over `(group code, value)` line pairs of an ASCII DXF buffer.
++struct Pairs<'a> {
++    data: &'a [u8],
++    pos: usize,
+ }
+ 
+-impl Builder {
+-    fn new(decimals: i32) -> Self {
+-        Builder {
+-            points: Vec::new(),
+-            faces: Vec::new(),
+-            index: FxHashMap::default(),
+-            scale: 10f64.powi(decimals),
++#[inline]
++fn trim(mut s: &[u8]) -> &[u8] {
++    while let [first, rest @ ..] = s {
++        if first.is_ascii_whitespace() {
++            s = rest;
++        } else {
++            break;
++        }
++    }
++    while let [rest @ .., last] = s {
++        if last.is_ascii_whitespace() {
++            s = rest;
++        } else {
++            break;
+         }
+     }
++    s
++}
+ 
+-    fn vertex_id(&mut self, v: Vertex) -> usize {
+-        let key = [
+-            (v[0] * self.scale).round() as i64,
+-            (v[1] * self.scale).round() as i64,
+-            (v[2] * self.scale).round() as i64,
+-        ];
+-        if let Some(&idx) = self.index.get(&key) {
+-            return idx;
++impl<'a> Pairs<'a> {
++    #[inline]
++    fn line(&mut self) -> Option<&'a [u8]> {
++        if self.pos >= self.data.len() {
++            return None;
+         }
+-        let idx = self.points.len();
+-        self.points.push(v);
+-        self.index.insert(key, idx);
+-        idx
++        let rest = &self.data[self.pos..];
++        let (line, advance) = match memchr::memchr(b'\n', rest) {
++            Some(i) => (&rest[..i], i + 1),
++            None => (rest, rest.len()),
++        };
++        self.pos += advance;
++        Some(trim(line))
+     }
++}
+ 
+-    fn push_entity(&mut self, entity: &Entity) {
+-        for tri in entity.triangles() {
+-            let ids = [
+-                self.vertex_id(entity.corners[tri[0]]),
+-                self.vertex_id(entity.corners[tri[1]]),
+-                self.vertex_id(entity.corners[tri[2]]),
+-            ];
+-            // Skip degenerate triangles (repeated vertices).
+-            if ids[0] != ids[1] && ids[1] != ids[2] && ids[0] != ids[2] {
+-                self.faces.push(ids);
+-            }
++impl<'a> Iterator for Pairs<'a> {
++    type Item = (&'a [u8], &'a [u8]);
++
++    #[inline]
++    fn next(&mut self) -> Option<Self::Item> {
++        let code = self.line()?;
++        let value = self.line()?;
++        Some((code, value))
++    }
++}
++
++#[inline]
++fn parse_code(code: &[u8]) -> Option<u32> {
++    if code.is_empty() || code.len() > 5 {
++        return None;
++    }
++    let mut n = 0u32;
++    for &b in code {
++        if !b.is_ascii_digit() {
++            return None;
+         }
++        n = n * 10 + u32::from(b - b'0');
+     }
++    Some(n)
+ }
+ 
+-/// Parse SOLID and 3DFACE entities from ASCII DXF content.
+-///
+-/// Vertices are merged when they are equal after rounding to `decimals` places.
+-fn parse_dxf(content: &str, decimals: i32) -> (Vec<Vertex>, Vec<[usize; 3]>) {
+-    let mut builder = Builder::new(decimals);
++/// Parse every SOLID / 3DFACE entity of `data`, which must start on a group code line
++/// and must not start in the middle of an entity.
++fn parse_chunk(data: &[u8]) -> Vec<Quad> {
++    // A quad takes roughly 150-250 bytes of text.
++    let mut quads = Vec::with_capacity(data.len() / 200);
+     let mut current: Option<Entity> = None;
+-    let mut lines = content.lines();
+ 
+-    while let (Some(code_line), Some(value_line)) = (lines.next(), lines.next()) {
+-        let Ok(code) = code_line.trim().parse::<i32>() else {
++    for (code, value) in (Pairs { data, pos: 0 }) {
++        let Some(code) = parse_code(code) else {
+             continue;
+         };
+-        let value = value_line.trim();
+-
+         if code == 0 {
+             if let Some(entity) = current.take() {
+-                builder.push_entity(&entity);
++                quads.push(entity.finish());
+             }
+             current = match value {
+-                "SOLID" => Some(Entity::new(Kind::Solid)),
+-                "3DFACE" => Some(Entity::new(Kind::Face3d)),
++                b"SOLID" => Some(Entity::new(Kind::Solid)),
++                b"3DFACE" => Some(Entity::new(Kind::Face3d)),
+                 _ => None,
+             };
+             continue;
+         }
+-
+         let Some(entity) = current.as_mut() else {
+             continue;
+         };
+@@ -130,7 +163,7 @@ fn parse_dxf(content: &str, decimals: i32) -> (Vec<Vertex>, Vec<[usize; 3]>) {
+             30..=33 => (2, (code - 30) as usize),
+             _ => continue,
+         };
+-        if let Ok(val) = value.parse::<f64>() {
++        if let Ok(val) = fast_float2::parse::<f64, _>(value) {
+             entity.corners[corner][axis] = val;
+             if corner == 3 {
+                 entity.has_fourth = true;
+@@ -138,199 +171,384 @@ fn parse_dxf(content: &str, decimals: i32) -> (Vec<Vertex>, Vec<[usize; 3]>) {
+         }
+     }
+     if let Some(entity) = current.take() {
+-        builder.push_entity(&entity);
++        quads.push(entity.finish());
+     }
++    quads
++}
+ 
+-    (builder.points, builder.faces)
++/// Split `data` in at most `n` chunks that each start on an entity boundary
++/// (a `0` group code line), so that they can be parsed independently.
++fn chunk_bounds(data: &[u8], n: usize) -> Vec<usize> {
++    let mut bounds = vec![0];
++    if n <= 1 {
++        bounds.push(data.len());
++        return bounds;
++    }
++    let mut lines_before = 0usize; // number of '\n' in data[..scanned]
++    let mut scanned = 0usize;
++    for k in 1..n {
++        let target = data.len() / n * k;
++        if target <= *bounds.last().unwrap() {
++            continue;
++        }
++        // Count lines up to `target`, then move to the start of the next line.
++        lines_before += memchr::memchr_iter(b'\n', &data[scanned..target]).count();
++        let Some(i) = memchr::memchr(b'\n', &data[target..]) else {
++            break;
++        };
++        let mut pos = target + i + 1;
++        lines_before += 1;
++        scanned = pos;
++        // Group codes are on even lines: skip a value line if needed.
++        if lines_before % 2 == 1 {
++            let Some(i) = memchr::memchr(b'\n', &data[pos..]) else {
++                break;
++            };
++            pos += i + 1;
++            lines_before += 1;
++            scanned = pos;
++        }
++        // Advance pair by pair to the next entity (group code 0).
++        let mut pairs = Pairs { data, pos };
++        loop {
++            let start = pairs.pos;
++            match pairs.next() {
++                Some((code, _)) if parse_code(code) == Some(0) => {
++                    pos = start;
++                    break;
++                }
++                Some(_) => {}
++                None => {
++                    pos = data.len();
++                    break;
++                }
++            }
++        }
++        if pos >= data.len() {
++            break;
++        }
++        // Keep the line counter in sync with the new scan position.
++        lines_before += memchr::memchr_iter(b'\n', &data[scanned..pos]).count();
++        scanned = pos;
++        if pos > *bounds.last().unwrap() {
++            bounds.push(pos);
++        }
++    }
++    bounds.push(data.len());
++    bounds
+ }
+ 
+-struct UnionFind {
+-    parent: Vec<usize>,
+-    rank: Vec<u32>,
++/// Mesh produced by the parser, stored as flat row-major buffers.
++struct Mesh {
++    points: Vec<f64>,
++    faces: Vec<i64>,
++    labels: Vec<i64>,
+ }
+ 
+-impl UnionFind {
+-    fn new(n: usize) -> Self {
+-        UnionFind {
+-            parent: (0..n).collect(),
+-            rank: vec![0; n],
++/// Merge the corners of all quads (vertices equal after rounding to `decimals`
++/// places are shared) and triangulate them.
++fn build_mesh(parts: &[Vec<Quad>], decimals: i32) -> Mesh {
++    let scale = 10f64.powi(decimals);
++    let n_quads: usize = parts.iter().map(Vec::len).sum();
++    let mut index: FxHashMap<[i64; 3], i64> =
++        FxHashMap::with_capacity_and_hasher(n_quads + n_quads / 4, Default::default());
++    let mut points: Vec<f64> = Vec::with_capacity(n_quads * 3);
++    let mut faces: Vec<i64> = Vec::with_capacity(n_quads * 6);
++
++    for quad in parts.iter().flatten() {
++        let n_corners = if quad.triangle { 3 } else { 4 };
++        let mut ids = [0i64; 4];
++        for (id, v) in ids.iter_mut().zip(&quad.corners).take(n_corners) {
++            let key = [
++                (v[0] * scale).round() as i64,
++                (v[1] * scale).round() as i64,
++                (v[2] * scale).round() as i64,
++            ];
++            let next = (points.len() / 3) as i64;
++            *id = *index.entry(key).or_insert_with(|| {
++                points.extend_from_slice(v);
++                next
++            });
+         }
+-    }
+-
+-    fn find(&mut self, x: usize) -> usize {
+-        if self.parent[x] != x {
+-            self.parent[x] = self.find(self.parent[x]);
++        let mut push = |a: i64, b: i64, c: i64| {
++            // Skip degenerate triangles (repeated vertices).
++            if a != b && b != c && a != c {
++                faces.extend_from_slice(&[a, b, c]);
++            }
++        };
++        push(ids[0], ids[1], ids[2]);
++        if !quad.triangle {
++            push(ids[0], ids[2], ids[3]);
+         }
+-        self.parent[x]
+     }
+ 
+-    fn union(&mut self, x: usize, y: usize) {
+-        let px = self.find(x);
+-        let py = self.find(y);
+-        if px != py {
+-            if self.rank[px] < self.rank[py] {
+-                self.parent[px] = py;
+-            } else if self.rank[px] > self.rank[py] {
+-                self.parent[py] = px;
+-            } else {
+-                self.parent[py] = px;
+-                self.rank[px] += 1;
+-            }
+-        }
++    let n_points = points.len() / 3;
++    let labels = connected_components(n_points, &faces);
++    Mesh {
++        points,
++        faces,
++        labels,
+     }
+ }
+ 
+-fn extract_components(n_points: usize, faces: &[[usize; 3]]) -> Vec<usize> {
+-    if n_points == 0 {
+-        return Vec::new();
++fn find(parent: &mut [u32], mut x: usize) -> usize {
++    let mut root = x;
++    while parent[root] as usize != root {
++        root = parent[root] as usize;
+     }
+-    let max_vertex = n_points - 1;
+-    let mut uf = UnionFind::new(n_points);
+-
+-    for &face in faces {
+-        uf.union(face[0], face[1]);
+-        uf.union(face[1], face[2]);
++    // Path compression.
++    while parent[x] as usize != root {
++        let next = parent[x] as usize;
++        parent[x] = root as u32;
++        x = next;
+     }
++    root
++}
+ 
+-    let mut labels = vec![0; max_vertex + 1];
+-    let mut component_id = 0;
+-    let mut next_id = FxHashMap::default();
+-
+-    for i in 0..=max_vertex {
+-        let root = uf.find(i);
+-        if !next_id.contains_key(&root) {
+-            next_id.insert(root, component_id);
+-            component_id += 1;
++/// Connected-component id of every point (ids are numbered by first appearance).
++fn connected_components(n_points: usize, faces: &[i64]) -> Vec<i64> {
++    let mut parent: Vec<u32> = (0..n_points as u32).collect();
++    for tri in faces.chunks_exact(3) {
++        let a = find(&mut parent, tri[0] as usize);
++        for &other in &tri[1..] {
++            let b = find(&mut parent, other as usize);
++            let a = find(&mut parent, a);
++            if a != b {
++                parent[b] = a as u32;
++            }
+         }
+-        labels[i] = next_id[&root];
+     }
+-
++    let mut ids = vec![-1i64; n_points];
++    let mut labels = Vec::with_capacity(n_points);
++    let mut next = 0i64;
++    for i in 0..n_points {
++        let root = find(&mut parent, i);
++        if ids[root] < 0 {
++            ids[root] = next;
++            next += 1;
++        }
++        labels.push(ids[root]);
++    }
+     labels
+ }
+ 
+-fn write_dxf_face(vertices: &[Vertex; 3], face_id: usize) -> String {
+-    let mut dxf_data = String::new();
+-    dxf_data.push_str("  0\n3DFACE\n");
+-    dxf_data.push_str("  8\n0\n");
+-    dxf_data.push_str(&format!(" 62\n{}\n", face_id % 255 + 1));
+-
+-    // A 3DFACE always has four corners; a triangle repeats the third one.
+-    for i in 0..4 {
+-        let v = vertices[i.min(2)];
+-        dxf_data.push_str(&format!(" {}\n{:.6}\n", 10 + i, v[0]));
+-        dxf_data.push_str(&format!(" {}\n{:.6}\n", 20 + i, v[1]));
+-        dxf_data.push_str(&format!(" {}\n{:.6}\n", 30 + i, v[2]));
+-    }
+-
+-    dxf_data
++fn parse_dxf(data: &[u8], decimals: i32) -> Mesh {
++    // Chunks are only worth it for large inputs.
++    let n_chunks = if data.len() > (4 << 20) {
++        rayon::current_num_threads().max(1) * 4
++    } else {
++        1
++    };
++    let bounds = chunk_bounds(data, n_chunks);
++    let parts: Vec<Vec<Quad>> = bounds
++        .windows(2)
++        .collect::<Vec<_>>()
++        .into_par_iter()
++        .map(|w| parse_chunk(&data[w[0]..w[1]]))
++        .collect();
++    build_mesh(&parts, decimals)
+ }
+ 
+-fn write_dxf(points: &[[f64; 3]], faces: &[[usize; 3]]) -> String {
+-    let mut dxf_content = String::new();
+-
+-    dxf_content.push_str("  0\nSECTION\n  2\nHEADER\n  9\n$ACADVER\n  1\nAC1018\n  0\nENDSEC\n");
+-    dxf_content.push_str("  0\nSECTION\n  2\nTABLES\n  0\nTABLE\n  2\nLAYER\n 70\n1\n");
+-    dxf_content.push_str("  0\nLAYER\n  2\n0\n 70\n0\n 62\n7\n  6\nCONTINUOUS\n  0\nENDTAB\n");
+-    dxf_content.push_str("  0\nENDSEC\n  0\nSECTION\n  2\nENTITIES\n");
+-
+-    for (face_idx, face) in faces.iter().enumerate() {
+-        let vertices = [
+-            points[face[0]],
+-            points[face[1]],
+-            points[face[2]],
+-        ];
+-        dxf_content.push_str(&write_dxf_face(&vertices, face_idx));
++// ---------------------------------------------------------------------------
++// Writing
++// ---------------------------------------------------------------------------
++
++const DXF_HEADER: &str = "  0\nSECTION\n  2\nHEADER\n  9\n$ACADVER\n  1\nAC1018\n  0\nENDSEC\n\
++  0\nSECTION\n  2\nTABLES\n  0\nTABLE\n  2\nLAYER\n 70\n1\n\
++  0\nLAYER\n  2\n0\n 70\n0\n 62\n7\n  6\nCONTINUOUS\n  0\nENDTAB\n\
++  0\nENDSEC\n  0\nSECTION\n  2\nENTITIES\n";
++const DXF_FOOTER: &str = "  0\nENDSEC\n  0\nEOF\n";
++
++/// Append `v` with six decimals (like `format!("{:.6}", v)`, but much faster).
++fn push_fixed6(buf: &mut Vec<u8>, v: f64) {
++    if !v.is_finite() || v.abs() >= 1e12 {
++        let _ = write!(buf, "{v:.6}");
++        return;
+     }
+-
+-    dxf_content.push_str("  0\nENDSEC\n  0\nEOF\n");
+-    dxf_content
+-}
+-
+-#[pyclass]
+-struct RawMesh {
+-    #[pyo3(get)]
+-    points: Vec<[f64; 3]>,
+-    #[pyo3(get)]
+-    faces: Vec<[usize; 3]>,
+-    #[pyo3(get)]
+-    labels: Vec<usize>,
++    let scaled = (v.abs() * 1e6).round() as u64;
++    if v.is_sign_negative() && scaled != 0 {
++        buf.push(b'-');
++    }
++    push_u64(buf, scaled / 1_000_000);
++    buf.push(b'.');
++    let frac = (scaled % 1_000_000) as u32;
++    let mut digits = [b'0'; 6];
++    let mut f = frac;
++    for d in digits.iter_mut().rev() {
++        *d = b'0' + (f % 10) as u8;
++        f /= 10;
++    }
++    buf.extend_from_slice(&digits);
+ }
+ 
+-#[pymethods]
+-impl RawMesh {
+-    #[new]
+-    fn new(points: Vec<[f64; 3]>, faces: Vec<[usize; 3]>, labels: Vec<usize>) -> Self {
+-        RawMesh {
+-            points,
+-            faces,
+-            labels,
++fn push_u64(buf: &mut Vec<u8>, mut n: u64) {
++    let mut tmp = [0u8; 20];
++    let mut i = tmp.len();
++    loop {
++        i -= 1;
++        tmp[i] = b'0' + (n % 10) as u8;
++        n /= 10;
++        if n == 0 {
++            break;
+         }
+     }
++    buf.extend_from_slice(&tmp[i..]);
++}
+ 
+-    #[getter]
+-    fn n_points(&self) -> usize {
+-        self.points.len()
++/// Render the 3DFACE entities of faces `first..first + faces.len() / 3`.
++fn render_faces(points: &[f64], faces: &[i64], first: usize) -> Vec<u8> {
++    let mut buf = Vec::with_capacity(faces.len() / 3 * 330);
++    for (k, tri) in faces.chunks_exact(3).enumerate() {
++        buf.extend_from_slice(b"  0\n3DFACE\n  8\n0\n 62\n");
++        push_u64(&mut buf, ((first + k) % 255 + 1) as u64);
++        buf.push(b'\n');
++        // A 3DFACE always has four corners; a triangle repeats the third one.
++        for corner in 0..4usize {
++            let p = tri[corner.min(2)] as usize * 3;
++            for (axis, base) in [10u64, 20, 30].into_iter().enumerate() {
++                buf.push(b' ');
++                push_u64(&mut buf, base + corner as u64);
++                buf.push(b'\n');
++                push_fixed6(&mut buf, points[p + axis]);
++                buf.push(b'\n');
++            }
++        }
+     }
++    buf
++}
+ 
+-    #[getter]
+-    fn n_faces(&self) -> usize {
+-        self.faces.len()
++fn check_faces(n_points: usize, faces: &[i64]) -> Result<(), String> {
++    match faces.iter().find(|&&i| i < 0 || i as usize >= n_points) {
++        Some(i) => Err(format!(
++            "face index {i} is out of range for a mesh with {n_points} points"
++        )),
++        None => Ok(()),
+     }
++}
+ 
+-    #[getter]
+-    fn n_components(&self) -> usize {
+-        self.labels.iter().max().map_or(0, |m| m + 1)
++/// Write a complete DXF document to `sink`, formatting faces in parallel.
++fn write_dxf<W: Write>(sink: &mut W, points: &[f64], faces: &[i64]) -> io::Result<()> {
++    const BLOCK: usize = 16_384; // faces per parallel work item
++    sink.write_all(DXF_HEADER.as_bytes())?;
++    let batch = BLOCK * 3 * rayon::current_num_threads().max(1) * 4;
++    let mut first = 0usize;
++    for group in faces.chunks(batch) {
++        let rendered: Vec<Vec<u8>> = group
++            .par_chunks(BLOCK * 3)
++            .enumerate()
++            .map(|(i, chunk)| render_faces(points, chunk, first + i * BLOCK))
++            .collect();
++        for part in &rendered {
++            sink.write_all(part)?;
++        }
++        first += group.len() / 3;
+     }
++    sink.write_all(DXF_FOOTER.as_bytes())
++}
+ 
+-    fn points_array<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<f64>> {
+-        let points_2d = Array2::from_shape_vec(
+-            (self.points.len(), 3),
+-            self.points.iter().flat_map(|p| vec![p[0], p[1], p[2]]).collect(),
+-        )
+-        .unwrap();
+-        points_2d.into_pyarray(py)
+-    }
++// ---------------------------------------------------------------------------
++// Python API
++// ---------------------------------------------------------------------------
++
++type MeshArrays<'py> = (
++    Bound<'py, PyArray2<f64>>,
++    Bound<'py, PyArray2<i64>>,
++    Bound<'py, PyArray1<i64>>,
++);
++
++fn into_arrays<'py>(py: Python<'py>, mesh: Mesh) -> PyResult<MeshArrays<'py>> {
++    let n_points = mesh.points.len() / 3;
++    let n_faces = mesh.faces.len() / 3;
++    let points = Array2::from_shape_vec((n_points, 3), mesh.points)
++        .map_err(|e| PyValueError::new_err(e.to_string()))?;
++    let faces = Array2::from_shape_vec((n_faces, 3), mesh.faces)
++        .map_err(|e| PyValueError::new_err(e.to_string()))?;
++    Ok((
++        points.into_pyarray(py),
++        faces.into_pyarray(py),
++        PyArray1::from_vec(py, mesh.labels),
++    ))
++}
+ 
+-    fn faces_array<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<usize>> {
+-        let faces_2d = Array2::from_shape_vec(
+-            (self.faces.len(), 3),
+-            self.faces.iter().flat_map(|f| vec![f[0], f[1], f[2]]).collect(),
+-        )
+-        .unwrap();
+-        faces_2d.into_pyarray(py)
+-    }
++/// Parse DXF content given as bytes.
++///
++/// Returns ``(points, faces, labels)``: float64 ``(N, 3)`` coordinates, int64
++/// ``(M, 3)`` triangle indices and the int64 connected-component id of each point.
++#[pyfunction]
++#[pyo3(signature = (data, decimals = 6))]
++fn parse_dxf_bytes<'py>(py: Python<'py>, data: &[u8], decimals: i32) -> PyResult<MeshArrays<'py>> {
++    let mesh = py.detach(|| parse_dxf(data, decimals));
++    into_arrays(py, mesh)
++}
+ 
+-    fn labels_array<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<usize>> {
+-        Array1::from_vec(self.labels.clone()).into_pyarray(py)
+-    }
++/// Parse a DXF file (read directly by Rust, without going through a Python string).
++#[pyfunction]
++#[pyo3(signature = (path, decimals = 6))]
++fn parse_dxf_file<'py>(py: Python<'py>, path: PathBuf, decimals: i32) -> PyResult<MeshArrays<'py>> {
++    let mesh = py.detach(|| -> io::Result<Mesh> {
++        let data = std::fs::read(&path)?;
++        Ok(parse_dxf(&data, decimals))
++    })?;
++    into_arrays(py, mesh)
++}
+ 
+-    fn to_dxf(&self) -> String {
+-        write_dxf(&self.points, &self.faces)
++fn views<'a>(
++    points: &'a PyReadonlyArray2<'_, f64>,
++    faces: &'a PyReadonlyArray2<'_, i64>,
++) -> PyResult<(&'a [f64], &'a [i64])> {
++    if points.shape()[1] != 3 || faces.shape()[1] != 3 {
++        return Err(PyValueError::new_err(
++            "points and faces must have shape (N, 3)",
++        ));
+     }
++    let pts = points
++        .as_slice()
++        .map_err(|_| PyValueError::new_err("points must be C-contiguous"))?;
++    let fcs = faces
++        .as_slice()
++        .map_err(|_| PyValueError::new_err("faces must be C-contiguous"))?;
++    check_faces(pts.len() / 3, fcs).map_err(PyValueError::new_err)?;
++    Ok((pts, fcs))
+ }
+ 
++/// Render a triangle mesh as a DXF document made of 3DFACE entities.
+ #[pyfunction]
+-#[pyo3(signature = (dxf_content, decimals = 6))]
+-fn parse_dxf_fast(dxf_content: &str, decimals: i32) -> PyResult<RawMesh> {
+-    let (points, faces) = parse_dxf(dxf_content, decimals);
+-    let labels = extract_components(points.len(), &faces);
+-
+-    Ok(RawMesh {
+-        points,
+-        faces,
+-        labels,
+-    })
++fn write_dxf_string(
++    py: Python<'_>,
++    points: PyReadonlyArray2<'_, f64>,
++    faces: PyReadonlyArray2<'_, i64>,
++) -> PyResult<String> {
++    let (pts, fcs) = views(&points, &faces)?;
++    let bytes = py.detach(|| -> io::Result<Vec<u8>> {
++        let mut out = Vec::with_capacity(fcs.len() / 3 * 330 + 512);
++        write_dxf(&mut out, pts, fcs)?;
++        Ok(out)
++    })?;
++    String::from_utf8(bytes).map_err(|e| PyValueError::new_err(e.to_string()))
+ }
+ 
++/// Write a triangle mesh to ``path`` as a DXF document made of 3DFACE entities.
+ #[pyfunction]
+-fn write_dxf_fast(points: Vec<[f64; 3]>, faces: Vec<[usize; 3]>) -> PyResult<String> {
+-    Ok(write_dxf(&points, &faces))
++fn write_dxf_file(
++    py: Python<'_>,
++    path: PathBuf,
++    points: PyReadonlyArray2<'_, f64>,
++    faces: PyReadonlyArray2<'_, i64>,
++) -> PyResult<()> {
++    let (pts, fcs) = views(&points, &faces)?;
++    py.detach(|| -> io::Result<()> {
++        let mut out = BufWriter::with_capacity(1 << 20, File::create(&path)?);
++        write_dxf(&mut out, pts, fcs)?;
++        out.flush()
++    })?;
++    Ok(())
+ }
+ 
+ #[pymodule]
+ fn _dxf_io(m: &Bound<'_, PyModule>) -> PyResult<()> {
+-    m.add_function(wrap_pyfunction!(parse_dxf_fast, m)?)?;
+-    m.add_function(wrap_pyfunction!(write_dxf_fast, m)?)?;
+-    m.add_class::<RawMesh>()?;
++    m.add_function(wrap_pyfunction!(parse_dxf_bytes, m)?)?;
++    m.add_function(wrap_pyfunction!(parse_dxf_file, m)?)?;
++    m.add_function(wrap_pyfunction!(write_dxf_string, m)?)?;
++    m.add_function(wrap_pyfunction!(write_dxf_file, m)?)?;
+     Ok(())
+ }
+diff --git a/tests/test_basic.py b/tests/test_basic.py
+index 50bc2c1..5a317e2 100644
+--- a/tests/test_basic.py
++++ b/tests/test_basic.py
+@@ -2,6 +2,7 @@
+ 
+ from __future__ import annotations
+ 
++from collections.abc import Sequence
+ from pathlib import Path
+ 
+ import numpy as np
+@@ -16,7 +17,7 @@ from dxf_io import (
+ )
+ 
+ 
+-def _entity(name: str, corners: list[tuple[float, float, float]]) -> str:
++def _entity(name: str, corners: Sequence[Sequence[float]]) -> str:
+     out = f"  0\n{name}\n  8\n0\n"
+     for i, (x, y, z) in enumerate(corners):
+         out += f" {10 + i}\n{x}\n {20 + i}\n{y}\n {30 + i}\n{z}\n"
+@@ -94,6 +95,129 @@ class TestParsing:
+             parse_dxf_fast(tmp_path / "missing.dxf")
+ 
+ 
++def _grid_dxf(n: int, parts: int = 1, eol: str = "\n", kind: str = "3DFACE") -> str:
++    """``parts`` disjoint n x n grids of quads."""
++    chunks = []
++    for part in range(parts):
++        off = part * (n + 5)
++        for i in range(n):
++            for j in range(n):
++                x, y = off + i, j
++                corners = [(x, y, 0), (x + 1, y, 0), (x + 1, y + 1, 0), (x, y + 1, 0)]
++                if kind == "SOLID":  # zig-zag order
++                    corners[2], corners[3] = corners[3], corners[2]
++                chunks.append(_entity(kind, corners))
++    return _dxf(*chunks).replace("\n", eol)
++
++
++class TestLargeInputs:
++    """Inputs above 4 MB are split in chunks and parsed in parallel."""
++
++    @pytest.mark.parametrize("eol", ["\n", "\r\n"])
++    @pytest.mark.parametrize("kind", ["3DFACE", "SOLID"])
++    def test_parallel_matches_expected(self, eol: str, kind: str) -> None:
++        n, parts = 150, 3
++        text = _grid_dxf(n, parts, eol, kind)
++        assert len(text) > 4 << 20  # large enough to be chunked
++        mesh = parse_dxf_fast(text)
++        assert mesh["points"].shape == (parts * (n + 1) ** 2, 3)
++        assert mesh["faces"].shape == (parts * 2 * n * n, 3)
++        assert sorted(set(mesh["labels"].tolist())) == list(range(parts))
++        pts = mesh["points"]
++        area = sum(
++            0.5 * abs(np.cross(pts[b] - pts[a], pts[c] - pts[a])[2])
++            for a, b, c in mesh["faces"][:: len(mesh["faces"]) // 500]
++        )
++        assert area == pytest.approx(0.5 * len(mesh["faces"][:: len(mesh["faces"]) // 500]))
++
++    def test_chunked_equals_single_chunk(self, tmp_path: Path) -> None:
++        big = _grid_dxf(150, 3)
++        small = _grid_dxf(5, 3)
++        # The same parser must give identical results however the input is cut:
++        # compare the big input to itself through the file path and the bytes path.
++        path = tmp_path / "big.dxf"
++        path.write_text(big, encoding="utf-8")
++        a, b = parse_dxf_fast(big), parse_dxf_fast(path)
++        for key in ("points", "faces", "labels"):
++            np.testing.assert_array_equal(a[key], b[key])
++        assert parse_dxf_fast(small)["faces"].shape == (3 * 2 * 25, 3)
++
++
++class TestEdgeCases:
++    def test_solid_with_three_corners(self) -> None:
++        text = _dxf(_entity("SOLID", [(0, 0, 0), (1, 0, 0), (0, 1, 0)]))
++        mesh = parse_dxf_fast(text)
++        assert mesh["points"].shape == (3, 3)
++        assert mesh["faces"].shape == (1, 3)
++        assert sorted(map(tuple, mesh["points"].tolist())) == [
++            (0.0, 0.0, 0.0),
++            (0.0, 1.0, 0.0),
++            (1.0, 0.0, 0.0),
++        ]
++
++    def test_degenerate_entities_are_dropped(self) -> None:
++        text = _dxf(_entity("3DFACE", [(0, 0, 0), (0, 0, 0), (1, 0, 0), (1, 0, 0)]))
++        assert parse_dxf_fast(text)["faces"].shape == (0, 3)
++
++    def test_no_trailing_newline(self) -> None:
++        assert parse_dxf_fast(_dxf(SQUARE).rstrip("\n") + "\n  0\nEOF")["faces"].shape == (2, 3)
++
++    def test_parse_is_independent_of_decimals_type_hint(self) -> None:
++        assert parse_dxf_fast(_dxf(SQUARE), 0)["points"].shape == (4, 3)
++
++
++class TestWriteFormat:
++    def test_numbers_and_codes(self) -> None:
++        pts = np.array([[-0.5, 1234.5678915, 0.0], [1e-9, -1e-9, 2.0], [3.0, 4.0, 5.0]])
++        text = write_dxf_fast(pts, np.array([[0, 1, 2]]))
++        lines = text.splitlines()
++        body = lines[lines.index("ENTITIES") + 1 :]
++        assert body[:6] == ["  0", "3DFACE", "  8", "0", " 62", "1"]
++        pairs = {k.strip(): v for k, v in zip(body[6:30:2], body[7:30:2])}
++        # Each of the 12 group codes (10-13, 20-23, 30-33) appears exactly once.
++        assert sorted(pairs, key=int) == [
++            str(c) for c in (10, 11, 12, 13, 20, 21, 22, 23, 30, 31, 32, 33)
++        ]
++        assert pairs["10"] == "-0.500000"
++        assert pairs["20"] in ("1234.567891", "1234.567892")
++        assert pairs["11"] == "0.000000" and pairs["21"] == "0.000000"  # no "-0.000000"
++        assert pairs["13"] == pairs["12"] and pairs["33"] == pairs["32"]  # triangle
++
++    def test_huge_values_fall_back(self) -> None:
++        text = write_dxf_fast(np.array([[1e15, 0, 0], [0, 1, 0], [0, 0, 1]]), np.array([[0, 1, 2]]))
++        assert "1000000000000000.000000" in text
++
++    def test_file_equals_string(self, tmp_path: Path) -> None:
++        data = parse_dxf_fast(_grid_dxf(40, 2))
++        out = tmp_path / "f.dxf"
++        write_dxf_fast(data["points"], data["faces"], out)
++        assert out.read_text(encoding="utf-8") == write_dxf_fast(data["points"], data["faces"])
++
++    def test_large_roundtrip_is_lossless(self, tmp_path: Path) -> None:
++        # Enough faces for several parallel render blocks.
++        data = parse_dxf_fast(_grid_dxf(130, 1))
++        assert len(data["faces"]) > 16_384
++        out = tmp_path / "big.dxf"
++        write_dxf_fast(data["points"], data["faces"], out)
++        again = parse_dxf_fast(out)
++        assert again["faces"].shape == data["faces"].shape
++        np.testing.assert_allclose(again["points"], data["points"])
++
++    def test_non_contiguous_and_other_dtypes(self) -> None:
++        pts = np.arange(18.0).reshape(3, 6)[:, ::2]  # non-contiguous view
++        faces = np.array([[0, 1, 2]], dtype=np.int32)
++        assert write_dxf_fast(pts, faces).count("3DFACE") == 1
++
++    @pytest.mark.parametrize("faces", [[[0, 1, 3]], [[-1, 0, 1]]])
++    def test_bad_index(self, faces: list[list[int]]) -> None:
++        with pytest.raises(ValueError, match="out of range"):
++            write_dxf_fast(np.zeros((3, 3)), np.array(faces))
++
++    def test_bad_shape(self) -> None:
++        with pytest.raises(ValueError):
++            write_dxf_fast(np.zeros((3, 2)), np.array([[0, 1, 2]]))
++
++
+ class TestComponents:
+     def test_split(self) -> None:
+         meshes = dxf_to_manifold_meshes(TWO_PARTS, use_pyvista=False)
+@@ -138,8 +262,8 @@ class TestWriting:
+         data = parse_dxf_fast(_dxf(SQUARE))
+         mesh = MeshWithAttributes(data["points"], data["faces"])
+         out = tmp_path / "m.dxf"
+-        text = mesh.to_dxf(out)
+-        assert out.read_text(encoding="utf-8") == text
++        assert mesh.to_dxf(out) is None
++        assert out.read_text(encoding="utf-8") == mesh.to_dxf()
+ 
+ 
+ def test_pyvista_optional() -> None:

@@ -1,18 +1,39 @@
-use ndarray::{Array1, Array2};
-use numpy::{IntoPyArray, PyArray1, PyArray2};
+//! Fast SOLID / 3DFACE reader and writer for ASCII DXF files.
+//!
+//! The Python-facing API lives at the bottom of this file; everything above is plain
+//! Rust so that it can be unit-tested without an interpreter.
+
+use std::fs::File;
+use std::io::{self, BufWriter, Write};
+use std::path::PathBuf;
+
+use ndarray::Array2;
+use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray2, PyUntypedArrayMethods};
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
 type Vertex = [f64; 3];
 
-/// Entity currently being read from the DXF stream.
+// ---------------------------------------------------------------------------
+// Parsing
+// ---------------------------------------------------------------------------
+
+/// One SOLID / 3DFACE entity, with corners already in perimeter order.
+#[derive(Clone, Copy)]
+struct Quad {
+    corners: [Vertex; 4],
+    /// `true` when the entity is a triangle (4th corner missing or repeated).
+    triangle: bool,
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum Kind {
     Solid,
     Face3d,
 }
 
-/// Accumulates the (up to) four corners of a SOLID / 3DFACE entity.
 struct Entity {
     kind: Kind,
     corners: [Vertex; 4],
@@ -28,98 +49,110 @@ impl Entity {
         }
     }
 
-    /// Triangles (as corner indices) describing the entity.
-    ///
-    /// For SOLID the corners are stored in "zig-zag" order (0, 1, 3, 2 around the
-    /// perimeter), whereas 3DFACE stores them in perimeter order.
-    fn triangles(&self) -> Vec<[usize; 3]> {
-        let perimeter: [usize; 4] = match self.kind {
-            Kind::Solid => [0, 1, 3, 2],
-            Kind::Face3d => [0, 1, 2, 3],
-        };
-        let c = &self.corners;
+    fn finish(mut self) -> Quad {
         // A missing or repeated 4th corner means the entity is a triangle.
-        if !self.has_fourth || c[3] == c[2] {
-            return vec![[0, 1, 2]];
+        let triangle = !self.has_fourth || self.corners[3] == self.corners[2];
+        // SOLID stores the corners of a quad in "zig-zag" order (0, 1, 3, 2 around the
+        // perimeter), whereas 3DFACE stores them in perimeter order.
+        if self.kind == Kind::Solid && !triangle {
+            self.corners.swap(2, 3);
         }
-        let [a, b, cc, d] = perimeter;
-        vec![[a, b, cc], [a, cc, d]]
-    }
-}
-
-struct Builder {
-    points: Vec<Vertex>,
-    faces: Vec<[usize; 3]>,
-    index: FxHashMap<[i64; 3], usize>,
-    scale: f64,
-}
-
-impl Builder {
-    fn new(decimals: i32) -> Self {
-        Builder {
-            points: Vec::new(),
-            faces: Vec::new(),
-            index: FxHashMap::default(),
-            scale: 10f64.powi(decimals),
-        }
-    }
-
-    fn vertex_id(&mut self, v: Vertex) -> usize {
-        let key = [
-            (v[0] * self.scale).round() as i64,
-            (v[1] * self.scale).round() as i64,
-            (v[2] * self.scale).round() as i64,
-        ];
-        if let Some(&idx) = self.index.get(&key) {
-            return idx;
-        }
-        let idx = self.points.len();
-        self.points.push(v);
-        self.index.insert(key, idx);
-        idx
-    }
-
-    fn push_entity(&mut self, entity: &Entity) {
-        for tri in entity.triangles() {
-            let ids = [
-                self.vertex_id(entity.corners[tri[0]]),
-                self.vertex_id(entity.corners[tri[1]]),
-                self.vertex_id(entity.corners[tri[2]]),
-            ];
-            // Skip degenerate triangles (repeated vertices).
-            if ids[0] != ids[1] && ids[1] != ids[2] && ids[0] != ids[2] {
-                self.faces.push(ids);
-            }
+        Quad {
+            corners: self.corners,
+            triangle,
         }
     }
 }
 
-/// Parse SOLID and 3DFACE entities from ASCII DXF content.
-///
-/// Vertices are merged when they are equal after rounding to `decimals` places.
-fn parse_dxf(content: &str, decimals: i32) -> (Vec<Vertex>, Vec<[usize; 3]>) {
-    let mut builder = Builder::new(decimals);
+/// Iterator over `(group code, value)` line pairs of an ASCII DXF buffer.
+struct Pairs<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+#[inline]
+fn trim(mut s: &[u8]) -> &[u8] {
+    while let [first, rest @ ..] = s {
+        if first.is_ascii_whitespace() {
+            s = rest;
+        } else {
+            break;
+        }
+    }
+    while let [rest @ .., last] = s {
+        if last.is_ascii_whitespace() {
+            s = rest;
+        } else {
+            break;
+        }
+    }
+    s
+}
+
+impl<'a> Pairs<'a> {
+    #[inline]
+    fn line(&mut self) -> Option<&'a [u8]> {
+        if self.pos >= self.data.len() {
+            return None;
+        }
+        let rest = &self.data[self.pos..];
+        let (line, advance) = match memchr::memchr(b'\n', rest) {
+            Some(i) => (&rest[..i], i + 1),
+            None => (rest, rest.len()),
+        };
+        self.pos += advance;
+        Some(trim(line))
+    }
+}
+
+impl<'a> Iterator for Pairs<'a> {
+    type Item = (&'a [u8], &'a [u8]);
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        let code = self.line()?;
+        let value = self.line()?;
+        Some((code, value))
+    }
+}
+
+#[inline]
+fn parse_code(code: &[u8]) -> Option<u32> {
+    if code.is_empty() || code.len() > 5 {
+        return None;
+    }
+    let mut n = 0u32;
+    for &b in code {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        n = n * 10 + u32::from(b - b'0');
+    }
+    Some(n)
+}
+
+/// Parse every SOLID / 3DFACE entity of `data`, which must start on a group code line
+/// and must not start in the middle of an entity.
+fn parse_chunk(data: &[u8]) -> Vec<Quad> {
+    // A quad takes roughly 150-250 bytes of text.
+    let mut quads = Vec::with_capacity(data.len() / 200);
     let mut current: Option<Entity> = None;
-    let mut lines = content.lines();
 
-    while let (Some(code_line), Some(value_line)) = (lines.next(), lines.next()) {
-        let Ok(code) = code_line.trim().parse::<i32>() else {
+    for (code, value) in (Pairs { data, pos: 0 }) {
+        let Some(code) = parse_code(code) else {
             continue;
         };
-        let value = value_line.trim();
-
         if code == 0 {
             if let Some(entity) = current.take() {
-                builder.push_entity(&entity);
+                quads.push(entity.finish());
             }
             current = match value {
-                "SOLID" => Some(Entity::new(Kind::Solid)),
-                "3DFACE" => Some(Entity::new(Kind::Face3d)),
+                b"SOLID" => Some(Entity::new(Kind::Solid)),
+                b"3DFACE" => Some(Entity::new(Kind::Face3d)),
                 _ => None,
             };
             continue;
         }
-
         let Some(entity) = current.as_mut() else {
             continue;
         };
@@ -130,7 +163,7 @@ fn parse_dxf(content: &str, decimals: i32) -> (Vec<Vertex>, Vec<[usize; 3]>) {
             30..=33 => (2, (code - 30) as usize),
             _ => continue,
         };
-        if let Ok(val) = value.parse::<f64>() {
+        if let Ok(val) = fast_float2::parse::<f64, _>(value) {
             entity.corners[corner][axis] = val;
             if corner == 3 {
                 entity.has_fourth = true;
@@ -138,199 +171,384 @@ fn parse_dxf(content: &str, decimals: i32) -> (Vec<Vertex>, Vec<[usize; 3]>) {
         }
     }
     if let Some(entity) = current.take() {
-        builder.push_entity(&entity);
+        quads.push(entity.finish());
     }
-
-    (builder.points, builder.faces)
+    quads
 }
 
-struct UnionFind {
-    parent: Vec<usize>,
-    rank: Vec<u32>,
-}
-
-impl UnionFind {
-    fn new(n: usize) -> Self {
-        UnionFind {
-            parent: (0..n).collect(),
-            rank: vec![0; n],
-        }
+/// Split `data` in at most `n` chunks that each start on an entity boundary
+/// (a `0` group code line), so that they can be parsed independently.
+fn chunk_bounds(data: &[u8], n: usize) -> Vec<usize> {
+    let mut bounds = vec![0];
+    if n <= 1 {
+        bounds.push(data.len());
+        return bounds;
     }
-
-    fn find(&mut self, x: usize) -> usize {
-        if self.parent[x] != x {
-            self.parent[x] = self.find(self.parent[x]);
+    let mut lines_before = 0usize; // number of '\n' in data[..scanned]
+    let mut scanned = 0usize;
+    for k in 1..n {
+        let target = data.len() / n * k;
+        if target <= *bounds.last().unwrap() {
+            continue;
         }
-        self.parent[x]
-    }
-
-    fn union(&mut self, x: usize, y: usize) {
-        let px = self.find(x);
-        let py = self.find(y);
-        if px != py {
-            if self.rank[px] < self.rank[py] {
-                self.parent[px] = py;
-            } else if self.rank[px] > self.rank[py] {
-                self.parent[py] = px;
-            } else {
-                self.parent[py] = px;
-                self.rank[px] += 1;
+        // Count lines up to `target`, then move to the start of the next line.
+        lines_before += memchr::memchr_iter(b'\n', &data[scanned..target]).count();
+        let Some(i) = memchr::memchr(b'\n', &data[target..]) else {
+            break;
+        };
+        let mut pos = target + i + 1;
+        lines_before += 1;
+        scanned = pos;
+        // Group codes are on even lines: skip a value line if needed.
+        if lines_before % 2 == 1 {
+            let Some(i) = memchr::memchr(b'\n', &data[pos..]) else {
+                break;
+            };
+            pos += i + 1;
+            lines_before += 1;
+            scanned = pos;
+        }
+        // Advance pair by pair to the next entity (group code 0).
+        let mut pairs = Pairs { data, pos };
+        loop {
+            let start = pairs.pos;
+            match pairs.next() {
+                Some((code, _)) if parse_code(code) == Some(0) => {
+                    pos = start;
+                    break;
+                }
+                Some(_) => {}
+                None => {
+                    pos = data.len();
+                    break;
+                }
             }
         }
-    }
-}
-
-fn extract_components(n_points: usize, faces: &[[usize; 3]]) -> Vec<usize> {
-    if n_points == 0 {
-        return Vec::new();
-    }
-    let max_vertex = n_points - 1;
-    let mut uf = UnionFind::new(n_points);
-
-    for &face in faces {
-        uf.union(face[0], face[1]);
-        uf.union(face[1], face[2]);
-    }
-
-    let mut labels = vec![0; max_vertex + 1];
-    let mut component_id = 0;
-    let mut next_id = FxHashMap::default();
-
-    for i in 0..=max_vertex {
-        let root = uf.find(i);
-        if !next_id.contains_key(&root) {
-            next_id.insert(root, component_id);
-            component_id += 1;
+        if pos >= data.len() {
+            break;
         }
-        labels[i] = next_id[&root];
+        // Keep the line counter in sync with the new scan position.
+        lines_before += memchr::memchr_iter(b'\n', &data[scanned..pos]).count();
+        scanned = pos;
+        if pos > *bounds.last().unwrap() {
+            bounds.push(pos);
+        }
     }
-
-    labels
+    bounds.push(data.len());
+    bounds
 }
 
-fn write_dxf_face(vertices: &[Vertex; 3], face_id: usize) -> String {
-    let mut dxf_data = String::new();
-    dxf_data.push_str("  0\n3DFACE\n");
-    dxf_data.push_str("  8\n0\n");
-    dxf_data.push_str(&format!(" 62\n{}\n", face_id % 255 + 1));
-
-    // A 3DFACE always has four corners; a triangle repeats the third one.
-    for i in 0..4 {
-        let v = vertices[i.min(2)];
-        dxf_data.push_str(&format!(" {}\n{:.6}\n", 10 + i, v[0]));
-        dxf_data.push_str(&format!(" {}\n{:.6}\n", 20 + i, v[1]));
-        dxf_data.push_str(&format!(" {}\n{:.6}\n", 30 + i, v[2]));
-    }
-
-    dxf_data
+/// Mesh produced by the parser, stored as flat row-major buffers.
+struct Mesh {
+    points: Vec<f64>,
+    faces: Vec<i64>,
+    labels: Vec<i64>,
 }
 
-fn write_dxf(points: &[[f64; 3]], faces: &[[usize; 3]]) -> String {
-    let mut dxf_content = String::new();
+/// Merge the corners of all quads (vertices equal after rounding to `decimals`
+/// places are shared) and triangulate them.
+fn build_mesh(parts: &[Vec<Quad>], decimals: i32) -> Mesh {
+    let scale = 10f64.powi(decimals);
+    let n_quads: usize = parts.iter().map(Vec::len).sum();
+    let mut index: FxHashMap<[i64; 3], i64> =
+        FxHashMap::with_capacity_and_hasher(n_quads + n_quads / 4, Default::default());
+    let mut points: Vec<f64> = Vec::with_capacity(n_quads * 3);
+    let mut faces: Vec<i64> = Vec::with_capacity(n_quads * 6);
 
-    dxf_content.push_str("  0\nSECTION\n  2\nHEADER\n  9\n$ACADVER\n  1\nAC1018\n  0\nENDSEC\n");
-    dxf_content.push_str("  0\nSECTION\n  2\nTABLES\n  0\nTABLE\n  2\nLAYER\n 70\n1\n");
-    dxf_content.push_str("  0\nLAYER\n  2\n0\n 70\n0\n 62\n7\n  6\nCONTINUOUS\n  0\nENDTAB\n");
-    dxf_content.push_str("  0\nENDSEC\n  0\nSECTION\n  2\nENTITIES\n");
-
-    for (face_idx, face) in faces.iter().enumerate() {
-        let vertices = [
-            points[face[0]],
-            points[face[1]],
-            points[face[2]],
-        ];
-        dxf_content.push_str(&write_dxf_face(&vertices, face_idx));
-    }
-
-    dxf_content.push_str("  0\nENDSEC\n  0\nEOF\n");
-    dxf_content
-}
-
-#[pyclass]
-struct RawMesh {
-    #[pyo3(get)]
-    points: Vec<[f64; 3]>,
-    #[pyo3(get)]
-    faces: Vec<[usize; 3]>,
-    #[pyo3(get)]
-    labels: Vec<usize>,
-}
-
-#[pymethods]
-impl RawMesh {
-    #[new]
-    fn new(points: Vec<[f64; 3]>, faces: Vec<[usize; 3]>, labels: Vec<usize>) -> Self {
-        RawMesh {
-            points,
-            faces,
-            labels,
+    for quad in parts.iter().flatten() {
+        let n_corners = if quad.triangle { 3 } else { 4 };
+        let mut ids = [0i64; 4];
+        for (id, v) in ids.iter_mut().zip(&quad.corners).take(n_corners) {
+            let key = [
+                (v[0] * scale).round() as i64,
+                (v[1] * scale).round() as i64,
+                (v[2] * scale).round() as i64,
+            ];
+            let next = (points.len() / 3) as i64;
+            *id = *index.entry(key).or_insert_with(|| {
+                points.extend_from_slice(v);
+                next
+            });
+        }
+        let mut push = |a: i64, b: i64, c: i64| {
+            // Skip degenerate triangles (repeated vertices).
+            if a != b && b != c && a != c {
+                faces.extend_from_slice(&[a, b, c]);
+            }
+        };
+        push(ids[0], ids[1], ids[2]);
+        if !quad.triangle {
+            push(ids[0], ids[2], ids[3]);
         }
     }
 
-    #[getter]
-    fn n_points(&self) -> usize {
-        self.points.len()
-    }
-
-    #[getter]
-    fn n_faces(&self) -> usize {
-        self.faces.len()
-    }
-
-    #[getter]
-    fn n_components(&self) -> usize {
-        self.labels.iter().max().map_or(0, |m| m + 1)
-    }
-
-    fn points_array<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<f64>> {
-        let points_2d = Array2::from_shape_vec(
-            (self.points.len(), 3),
-            self.points.iter().flat_map(|p| vec![p[0], p[1], p[2]]).collect(),
-        )
-        .unwrap();
-        points_2d.into_pyarray(py)
-    }
-
-    fn faces_array<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<usize>> {
-        let faces_2d = Array2::from_shape_vec(
-            (self.faces.len(), 3),
-            self.faces.iter().flat_map(|f| vec![f[0], f[1], f[2]]).collect(),
-        )
-        .unwrap();
-        faces_2d.into_pyarray(py)
-    }
-
-    fn labels_array<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<usize>> {
-        Array1::from_vec(self.labels.clone()).into_pyarray(py)
-    }
-
-    fn to_dxf(&self) -> String {
-        write_dxf(&self.points, &self.faces)
-    }
-}
-
-#[pyfunction]
-#[pyo3(signature = (dxf_content, decimals = 6))]
-fn parse_dxf_fast(dxf_content: &str, decimals: i32) -> PyResult<RawMesh> {
-    let (points, faces) = parse_dxf(dxf_content, decimals);
-    let labels = extract_components(points.len(), &faces);
-
-    Ok(RawMesh {
+    let n_points = points.len() / 3;
+    let labels = connected_components(n_points, &faces);
+    Mesh {
         points,
         faces,
         labels,
-    })
+    }
 }
 
+fn find(parent: &mut [u32], mut x: usize) -> usize {
+    let mut root = x;
+    while parent[root] as usize != root {
+        root = parent[root] as usize;
+    }
+    // Path compression.
+    while parent[x] as usize != root {
+        let next = parent[x] as usize;
+        parent[x] = root as u32;
+        x = next;
+    }
+    root
+}
+
+/// Connected-component id of every point (ids are numbered by first appearance).
+fn connected_components(n_points: usize, faces: &[i64]) -> Vec<i64> {
+    let mut parent: Vec<u32> = (0..n_points as u32).collect();
+    for tri in faces.chunks_exact(3) {
+        let a = find(&mut parent, tri[0] as usize);
+        for &other in &tri[1..] {
+            let b = find(&mut parent, other as usize);
+            let a = find(&mut parent, a);
+            if a != b {
+                parent[b] = a as u32;
+            }
+        }
+    }
+    let mut ids = vec![-1i64; n_points];
+    let mut labels = Vec::with_capacity(n_points);
+    let mut next = 0i64;
+    for i in 0..n_points {
+        let root = find(&mut parent, i);
+        if ids[root] < 0 {
+            ids[root] = next;
+            next += 1;
+        }
+        labels.push(ids[root]);
+    }
+    labels
+}
+
+fn parse_dxf(data: &[u8], decimals: i32) -> Mesh {
+    // Chunks are only worth it for large inputs.
+    let n_chunks = if data.len() > (4 << 20) {
+        rayon::current_num_threads().max(1) * 4
+    } else {
+        1
+    };
+    let bounds = chunk_bounds(data, n_chunks);
+    let parts: Vec<Vec<Quad>> = bounds
+        .windows(2)
+        .collect::<Vec<_>>()
+        .into_par_iter()
+        .map(|w| parse_chunk(&data[w[0]..w[1]]))
+        .collect();
+    build_mesh(&parts, decimals)
+}
+
+// ---------------------------------------------------------------------------
+// Writing
+// ---------------------------------------------------------------------------
+
+const DXF_HEADER: &str = "  0\nSECTION\n  2\nHEADER\n  9\n$ACADVER\n  1\nAC1018\n  0\nENDSEC\n\
+  0\nSECTION\n  2\nTABLES\n  0\nTABLE\n  2\nLAYER\n 70\n1\n\
+  0\nLAYER\n  2\n0\n 70\n0\n 62\n7\n  6\nCONTINUOUS\n  0\nENDTAB\n\
+  0\nENDSEC\n  0\nSECTION\n  2\nENTITIES\n";
+const DXF_FOOTER: &str = "  0\nENDSEC\n  0\nEOF\n";
+
+/// Append `v` with six decimals (like `format!("{:.6}", v)`, but much faster).
+fn push_fixed6(buf: &mut Vec<u8>, v: f64) {
+    if !v.is_finite() || v.abs() >= 1e12 {
+        let _ = write!(buf, "{v:.6}");
+        return;
+    }
+    let scaled = (v.abs() * 1e6).round() as u64;
+    if v.is_sign_negative() && scaled != 0 {
+        buf.push(b'-');
+    }
+    push_u64(buf, scaled / 1_000_000);
+    buf.push(b'.');
+    let frac = (scaled % 1_000_000) as u32;
+    let mut digits = [b'0'; 6];
+    let mut f = frac;
+    for d in digits.iter_mut().rev() {
+        *d = b'0' + (f % 10) as u8;
+        f /= 10;
+    }
+    buf.extend_from_slice(&digits);
+}
+
+fn push_u64(buf: &mut Vec<u8>, mut n: u64) {
+    let mut tmp = [0u8; 20];
+    let mut i = tmp.len();
+    loop {
+        i -= 1;
+        tmp[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    buf.extend_from_slice(&tmp[i..]);
+}
+
+/// Render the 3DFACE entities of faces `first..first + faces.len() / 3`.
+fn render_faces(points: &[f64], faces: &[i64], first: usize) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(faces.len() / 3 * 330);
+    for (k, tri) in faces.chunks_exact(3).enumerate() {
+        buf.extend_from_slice(b"  0\n3DFACE\n  8\n0\n 62\n");
+        push_u64(&mut buf, ((first + k) % 255 + 1) as u64);
+        buf.push(b'\n');
+        // A 3DFACE always has four corners; a triangle repeats the third one.
+        for corner in 0..4usize {
+            let p = tri[corner.min(2)] as usize * 3;
+            for (axis, base) in [10u64, 20, 30].into_iter().enumerate() {
+                buf.push(b' ');
+                push_u64(&mut buf, base + corner as u64);
+                buf.push(b'\n');
+                push_fixed6(&mut buf, points[p + axis]);
+                buf.push(b'\n');
+            }
+        }
+    }
+    buf
+}
+
+fn check_faces(n_points: usize, faces: &[i64]) -> Result<(), String> {
+    match faces.iter().find(|&&i| i < 0 || i as usize >= n_points) {
+        Some(i) => Err(format!(
+            "face index {i} is out of range for a mesh with {n_points} points"
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Write a complete DXF document to `sink`, formatting faces in parallel.
+fn write_dxf<W: Write>(sink: &mut W, points: &[f64], faces: &[i64]) -> io::Result<()> {
+    const BLOCK: usize = 16_384; // faces per parallel work item
+    sink.write_all(DXF_HEADER.as_bytes())?;
+    let batch = BLOCK * 3 * rayon::current_num_threads().max(1) * 4;
+    let mut first = 0usize;
+    for group in faces.chunks(batch) {
+        let rendered: Vec<Vec<u8>> = group
+            .par_chunks(BLOCK * 3)
+            .enumerate()
+            .map(|(i, chunk)| render_faces(points, chunk, first + i * BLOCK))
+            .collect();
+        for part in &rendered {
+            sink.write_all(part)?;
+        }
+        first += group.len() / 3;
+    }
+    sink.write_all(DXF_FOOTER.as_bytes())
+}
+
+// ---------------------------------------------------------------------------
+// Python API
+// ---------------------------------------------------------------------------
+
+type MeshArrays<'py> = (
+    Bound<'py, PyArray2<f64>>,
+    Bound<'py, PyArray2<i64>>,
+    Bound<'py, PyArray1<i64>>,
+);
+
+fn into_arrays<'py>(py: Python<'py>, mesh: Mesh) -> PyResult<MeshArrays<'py>> {
+    let n_points = mesh.points.len() / 3;
+    let n_faces = mesh.faces.len() / 3;
+    let points = Array2::from_shape_vec((n_points, 3), mesh.points)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let faces = Array2::from_shape_vec((n_faces, 3), mesh.faces)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    Ok((
+        points.into_pyarray(py),
+        faces.into_pyarray(py),
+        PyArray1::from_vec(py, mesh.labels),
+    ))
+}
+
+/// Parse DXF content given as bytes.
+///
+/// Returns ``(points, faces, labels)``: float64 ``(N, 3)`` coordinates, int64
+/// ``(M, 3)`` triangle indices and the int64 connected-component id of each point.
 #[pyfunction]
-fn write_dxf_fast(points: Vec<[f64; 3]>, faces: Vec<[usize; 3]>) -> PyResult<String> {
-    Ok(write_dxf(&points, &faces))
+#[pyo3(signature = (data, decimals = 6))]
+fn parse_dxf_bytes<'py>(py: Python<'py>, data: &[u8], decimals: i32) -> PyResult<MeshArrays<'py>> {
+    let mesh = py.detach(|| parse_dxf(data, decimals));
+    into_arrays(py, mesh)
+}
+
+/// Parse a DXF file (read directly by Rust, without going through a Python string).
+#[pyfunction]
+#[pyo3(signature = (path, decimals = 6))]
+fn parse_dxf_file<'py>(py: Python<'py>, path: PathBuf, decimals: i32) -> PyResult<MeshArrays<'py>> {
+    let mesh = py.detach(|| -> io::Result<Mesh> {
+        let data = std::fs::read(&path)?;
+        Ok(parse_dxf(&data, decimals))
+    })?;
+    into_arrays(py, mesh)
+}
+
+fn views<'a>(
+    points: &'a PyReadonlyArray2<'_, f64>,
+    faces: &'a PyReadonlyArray2<'_, i64>,
+) -> PyResult<(&'a [f64], &'a [i64])> {
+    if points.shape()[1] != 3 || faces.shape()[1] != 3 {
+        return Err(PyValueError::new_err(
+            "points and faces must have shape (N, 3)",
+        ));
+    }
+    let pts = points
+        .as_slice()
+        .map_err(|_| PyValueError::new_err("points must be C-contiguous"))?;
+    let fcs = faces
+        .as_slice()
+        .map_err(|_| PyValueError::new_err("faces must be C-contiguous"))?;
+    check_faces(pts.len() / 3, fcs).map_err(PyValueError::new_err)?;
+    Ok((pts, fcs))
+}
+
+/// Render a triangle mesh as a DXF document made of 3DFACE entities.
+#[pyfunction]
+fn write_dxf_string(
+    py: Python<'_>,
+    points: PyReadonlyArray2<'_, f64>,
+    faces: PyReadonlyArray2<'_, i64>,
+) -> PyResult<String> {
+    let (pts, fcs) = views(&points, &faces)?;
+    let bytes = py.detach(|| -> io::Result<Vec<u8>> {
+        let mut out = Vec::with_capacity(fcs.len() / 3 * 330 + 512);
+        write_dxf(&mut out, pts, fcs)?;
+        Ok(out)
+    })?;
+    String::from_utf8(bytes).map_err(|e| PyValueError::new_err(e.to_string()))
+}
+
+/// Write a triangle mesh to ``path`` as a DXF document made of 3DFACE entities.
+#[pyfunction]
+fn write_dxf_file(
+    py: Python<'_>,
+    path: PathBuf,
+    points: PyReadonlyArray2<'_, f64>,
+    faces: PyReadonlyArray2<'_, i64>,
+) -> PyResult<()> {
+    let (pts, fcs) = views(&points, &faces)?;
+    py.detach(|| -> io::Result<()> {
+        let mut out = BufWriter::with_capacity(1 << 20, File::create(&path)?);
+        write_dxf(&mut out, pts, fcs)?;
+        out.flush()
+    })?;
+    Ok(())
 }
 
 #[pymodule]
 fn _dxf_io(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(parse_dxf_fast, m)?)?;
-    m.add_function(wrap_pyfunction!(write_dxf_fast, m)?)?;
-    m.add_class::<RawMesh>()?;
+    m.add_function(wrap_pyfunction!(parse_dxf_bytes, m)?)?;
+    m.add_function(wrap_pyfunction!(parse_dxf_file, m)?)?;
+    m.add_function(wrap_pyfunction!(write_dxf_string, m)?)?;
+    m.add_function(wrap_pyfunction!(write_dxf_file, m)?)?;
     Ok(())
 }

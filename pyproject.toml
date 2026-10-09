@@ -122,8 +122,8 @@ known-first-party = ["dxf_io"]
 include = ["python", "tests"]
 
 [tool.ty.analysis]
-# Optional dependency, imported lazily.
-allowed-unresolved-imports = ["manifold3d"]
+# Optional dependencies, imported lazily.
+allowed-unresolved-imports = ["manifold3d", "ezdxf"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

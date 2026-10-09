@@ -9,6 +9,19 @@ dxf_io
 **The complete documentation can be found here**: `GitHub Repository <https://github.com/antoinecollet5/dxf_io>`_.
 
 
+===============
+⚡ Performance
+===============
+
+Parsing and writing run in Rust, use all the available cores and release the GIL.
+On a 190 MB file (4 million vertices, 2 million triangles), parsing takes under a second
+and writing about one second on a 2-core machine. On a 16 MB file, ``dxf_io`` is about
+100x faster than `ezdxf <https://ezdxf.mozman.at>`_ at merely reading and iterating the
+faces (and it also merges the vertices and finds the connected components).
+
+Reproduce with ``python benchmark.py --synthetic 150 --ezdxf`` after
+``maturin develop --release``.
+
 ===========
 🔑 License
 ===========
