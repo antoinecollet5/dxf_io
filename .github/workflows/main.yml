@@ -73,9 +73,23 @@ jobs:
           uv venv
           uv pip install -e .[all]
 
-      - name: Run tests with coverage
+      # For Windows (PowerShell) - ALL backticks for line continuation
+      - name: Run tests with coverage (Windows)
         env:
           COVERAGE_FILE: .coverage.${{ matrix.os }}.${{ matrix.python-version }}
+        if: runner.os == 'Windows'
+        run: |
+          uv run pytest `
+            --cov=dxf_io `
+            --cov-config=.coveragerc `
+            --cov-report=term `
+            --color=yes
+
+      # For Linux/macOS (Bash) - ALL backslashes for line continuation
+      - name: Run tests with coverage (Linux/macOS)
+        env:
+          COVERAGE_FILE: .coverage.${{ matrix.os }}.${{ matrix.python-version }}
+        if: runner.os != 'Windows'
         run: |
           uv run pytest \
             --cov=dxf_io \
