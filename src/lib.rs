@@ -22,12 +22,15 @@ type Vertex = [f64; 3];
 // Parsing
 // ---------------------------------------------------------------------------
 
-/// One SOLID / 3DFACE entity, with corners already in perimeter order.
+/// One SOLID / 3DFACE entity, with its corners in file order.
 #[derive(Clone, Copy)]
 struct Quad {
     corners: [Vertex; 4],
-    /// `true` when the entity is a triangle (4th corner missing or repeated).
+    /// `true` when the 4th corner is missing.
     triangle: bool,
+    /// SOLID stores the corners of a quad in "zig-zag" order (0, 1, 3, 2 around the
+    /// perimeter), whereas 3DFACE stores them in perimeter order.
+    solid: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -51,17 +54,13 @@ impl Entity {
         }
     }
 
-    fn finish(mut self) -> Quad {
-        // A missing or repeated 4th corner means the entity is a triangle.
-        let triangle = !self.has_fourth || self.corners[3] == self.corners[2];
-        // SOLID stores the corners of a quad in "zig-zag" order (0, 1, 3, 2 around the
-        // perimeter), whereas 3DFACE stores them in perimeter order.
-        if self.kind == Kind::Solid && !triangle {
-            self.corners.swap(2, 3);
-        }
+    fn finish(self) -> Quad {
+        // A 4th corner equal to the 3rd or the 1st (after vertex merging) also makes a
+        // triangle: this is decided in `build_mesh`.
         Quad {
             corners: self.corners,
-            triangle,
+            triangle: !self.has_fourth,
+            solid: self.kind == Kind::Solid,
         }
     }
 }
@@ -355,13 +354,17 @@ fn build_mesh(quads: &[Quad], decimals: i32) -> Result<Mesh, String> {
             for (k, id) in ids.iter_mut().enumerate().take(n) {
                 *id = vertex(4 * q + k);
             }
-            let tri = |a: i64, b: i64, c: i64| (a != b && b != c && a != c).then_some([a, b, c]);
             // Skip degenerate triangles (repeated vertices).
-            let first = tri(ids[0], ids[1], ids[2]);
-            let second = if quad.triangle {
-                None
+            let tri = |a: i64, b: i64, c: i64| (a != b && b != c && a != c).then_some([a, b, c]);
+            let [a, b, c, d] = ids;
+            // A 4th corner merged with the 3rd (DXF convention) or with the 1st (common
+            // exporter shortcut) makes a triangle, for SOLID and 3DFACE alike.
+            let (first, second) = if quad.triangle || d == c || d == a {
+                (tri(a, b, c), None)
+            } else if quad.solid {
+                (tri(a, b, d), tri(a, d, c)) // perimeter a, b, d, c
             } else {
-                tri(ids[0], ids[2], ids[3])
+                (tri(a, b, c), tri(a, c, d)) // perimeter a, b, c, d
             };
             first.into_iter().chain(second).flatten()
         })
@@ -393,7 +396,7 @@ fn find(parent: &mut [u32], mut x: usize) -> usize {
 /// Connected-component id of every point (ids are numbered by first appearance).
 fn connected_components(n_points: usize, faces: &[i64]) -> Vec<i64> {
     let mut parent: Vec<u32> = (0..n_points as u32).collect();
-    for tri in faces.chunks_exact(3) {
+    for tri in faces.as_chunks::<3>().0 {
         let a = find(&mut parent, tri[0] as usize);
         for &other in &tri[1..] {
             let b = find(&mut parent, other as usize);
@@ -488,7 +491,7 @@ fn push_u64(buf: &mut Vec<u8>, mut n: u64) {
 /// Render the 3DFACE entities of faces `first..first + faces.len() / 3`.
 fn render_faces(points: &[f64], faces: &[i64], first: usize) -> Vec<u8> {
     let mut buf = Vec::with_capacity(faces.len() / 3 * 330);
-    for (k, tri) in faces.chunks_exact(3).enumerate() {
+    for (k, tri) in faces.as_chunks::<3>().0.iter().enumerate() {
         buf.extend_from_slice(b"  0\n3DFACE\n  8\n0\n 62\n");
         push_u64(&mut buf, ((first + k) % 255 + 1) as u64);
         buf.push(b'\n');

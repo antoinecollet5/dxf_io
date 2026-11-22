@@ -72,8 +72,17 @@ Reproduce with ``python benchmark.py --synthetic 300 --ezdxf`` after
     uv run pytest && cargo test           # Python and Rust tests
     uv run ruff check . && uv run ruff format --check . && uv run ty check
 
-See `CONTRIBUTING.md <https://github.com/antoinecollet5/dxf_io/blob/main/CONTRIBUTING.md>`_
+See `CONTRIBUTING.md <https://github.com/antoinecollet5/dxf_io/blob/master/CONTRIBUTING.md>`_
 for the release process.
+
+=================
+🤖 AI assistance
+=================
+
+Parts of this project were developed with the help of
+`Claude <https://www.anthropic.com/claude>`_, Anthropic's AI assistant, under the
+direction of the maintainer: notably the parallel parsing and vertex merging in Rust,
+tests, packaging, and the CI and release workflows.
 
 ===========
 🔑 License
@@ -83,7 +92,7 @@ This project is released under the **BSD 3-Clause License**.
 
 Copyright (c) 2026, Antoine COLLET. All rights reserved.
 
-For more details, see the `LICENSE <https://github.com/antoinecollet5/dxf_io/blob/main/LICENSE>`_ file.
+For more details, see the `LICENSE <https://github.com/antoinecollet5/dxf_io/blob/master/LICENSE>`_ file.
 
 ==============
 ⚠️ Disclaimer
@@ -115,7 +124,7 @@ Contributions are welcome!
 - `PyVista <https://docs.pyvista.org>`_
 
 .. |License| image:: https://img.shields.io/badge/License-BSD_3--Clause-blue.svg
-    :target: https://github.com/antoinecollet5/dxf_io/blob/main/LICENSE
+    :target: https://github.com/antoinecollet5/dxf_io/blob/master/LICENSE
     :alt: License
 
 .. |Python| image:: https://img.shields.io/pypi/pyversions/dxf_io.svg

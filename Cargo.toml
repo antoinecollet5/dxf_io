@@ -2,6 +2,8 @@
 name = "dxf_io"
 version = "0.1.0"
 edition = "2021"
+# `slice::as_chunks` needs Rust 1.88.
+rust-version = "1.88"
 description = "Fast Rust-based DXF mesh reader-writer for Python."
 license = "BSD-3-Clause"
 repository = "https://github.com/antoinecollet5/dxf_io"

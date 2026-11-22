@@ -11,7 +11,18 @@ from typing import TYPE_CHECKING, Any, overload
 
 import numpy as np
 
-from . import _dxf_io as _rs
+try:
+    from . import _dxf_io as _rs
+except ImportError as exc:  # pragma: no cover - depends on the installation
+    import sys
+
+    raise ImportError(
+        "The compiled extension of dxf_io (dxf_io._dxf_io) is missing or was built for "
+        f"another Python version (this is Python {sys.version_info.major}."
+        f"{sys.version_info.minor}). In a development checkout, rebuild it with "
+        "`maturin develop --release` (or `uv sync --reinstall-package dxf_io`); "
+        "otherwise reinstall dxf_io with pip."
+    ) from exc
 
 if TYPE_CHECKING:
     import pyvista as pv
@@ -29,8 +40,12 @@ def parse_dxf_fast(dxf_file: str | os.PathLike[str], decimals: int = 6) -> dict[
     """Parse the SOLID and 3DFACE entities of an ASCII DXF file.
 
     Quads are split into two triangles, and vertices that are equal once rounded to
-    ``decimals`` places are merged. Files are read and parsed in Rust, using all the
-    available cores, without holding the GIL.
+    ``decimals`` places are merged. An entity whose 4th corner is missing, or equal to
+    its 3rd corner (DXF convention) or to its 1st one (common exporter shortcut) once
+    rounded, is a triangle. SOLID corners are in the DXF "zig-zag" order.
+
+    Files are read and parsed in Rust, using all the available cores, without holding
+    the GIL.
 
     Parameters
     ----------

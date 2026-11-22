@@ -48,7 +48,7 @@ Homepage = "https://github.com/antoinecollet5/dxf_io"
 Documentation = "https://github.com/antoinecollet5/dxf_io#readme"
 Repository = "https://github.com/antoinecollet5/dxf_io"
 Issues = "https://github.com/antoinecollet5/dxf_io/issues"
-Changelog = "https://github.com/antoinecollet5/dxf_io/blob/main/CHANGELOG.md"
+Changelog = "https://github.com/antoinecollet5/dxf_io/blob/master/CHANGELOG.md"
 
 # Development dependencies (PEP 735): `uv sync` installs the `dev` group by default,
 # `pip install --group dev` works with pip >= 25.1.

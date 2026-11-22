@@ -158,6 +158,19 @@ class TestEdgeCases:
             (1.0, 0.0, 0.0),
         ]
 
+    @pytest.mark.parametrize("kind", ["3DFACE", "SOLID"])
+    @pytest.mark.parametrize(
+        "fourth",
+        [(0, 1, 0), (0, 0, 0), (0, 1 + 1e-9, 0), (1e-9, 0, 0)],
+        ids=["equals-3rd", "equals-1st", "near-3rd", "near-1st"],
+    )
+    def test_triangle_conventions(self, kind: str, fourth: tuple[float, ...]) -> None:
+        # Triangles repeat their 3rd corner (DXF convention) or their 1st one (exporter
+        # shortcut), exactly or within ``decimals``.
+        mesh = parse_dxf_fast(_dxf(_entity(kind, [(0, 0, 0), (1, 0, 0), (0, 1, 0), fourth])))
+        assert mesh["faces"].shape == (1, 3)
+        assert mesh["points"].shape == (3, 3)
+
     def test_degenerate_entities_are_dropped(self) -> None:
         text = _dxf(_entity("3DFACE", [(0, 0, 0), (0, 0, 0), (1, 0, 0), (1, 0, 0)]))
         assert parse_dxf_fast(text)["faces"].shape == (0, 3)

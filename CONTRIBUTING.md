@@ -40,7 +40,7 @@ read it).
 
 1. Bump `version` in `Cargo.toml`, run `cargo check` to update `Cargo.lock`, and move
    the "Unreleased" entries of `CHANGELOG.md` under the new version.
-2. Commit, then tag and push: `git tag v0.2.0 && git push origin main v0.2.0`.
+2. Commit, then tag and push: `git tag v0.2.0 && git push origin master v0.2.0`.
 3. The `Release` workflow builds the sdist and the wheels for every platform, tests the
    wheels, publishes them to PyPI (trusted publishing) and creates a GitHub release.
 
