@@ -1,7 +1,9 @@
 name: Release
 
-# Pushing a tag `vX.Y.Z` builds the sdist and the wheels of every platform, tests the
-# wheels, publishes everything to PyPI and creates a GitHub release.
+# Pushing a tag `vX.Y.Z` (with git, or by publishing a release on GitHub, which creates
+# the tag) builds the sdist and the wheels of every platform, tests the wheels,
+# publishes everything to PyPI and creates the GitHub release (or attaches the files to
+# the one published by hand).
 # Running the workflow manually builds and tests everything without publishing.
 
 on:
@@ -207,11 +209,16 @@ jobs:
           merge-multiple: true
           path: dist
 
-      - name: Create the release
+      - name: Create the release, or attach the files to the existing one
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          flags=""
-          case "$GITHUB_REF_NAME" in *[0-9]a[0-9]*|*[0-9]b[0-9]*|*rc*) flags="--prerelease" ;; esac
-          gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --generate-notes $flags
+          if gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
+            # Release already created by hand (e.g. with GitHub's "Draft a new release").
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+          else
+            flags=""
+            case "$GITHUB_REF_NAME" in *[0-9]a[0-9]*|*[0-9]b[0-9]*|*rc*) flags="--prerelease" ;; esac
+            gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --generate-notes $flags
+          fi
