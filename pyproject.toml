@@ -1,146 +1,115 @@
 [build-system]
-requires = ["maturin>=1.5,<2"]
+requires = ["maturin>=1.9,<2"]
 build-backend = "maturin"
 
 [project]
 name = "dxf_io"
-version = "0.1.0"
-description = "Fast Rust-based DXF mesh reader-writer with pyvista and shapely support."
+# The version is taken from Cargo.toml: bump it there only.
+dynamic = ["version"]
+description = "Fast Rust-based DXF mesh reader and writer (SOLID / 3DFACE) with optional PyVista support."
 readme = "README.rst"
-requires-python = ">=3.8"
+requires-python = ">=3.10"
 authors = [{ name = "Antoine Collet", email = "antoine.collet5@gmail.com" }]
-keywords = ["DXF", "mesh", "parsing", "geometry", "Rust", "performance"]
-license = { file = "LICENSE" }
+keywords = ["DXF", "mesh", "parser", "writer", "3DFACE", "geometry", "CAD", "pyvista", "Rust"]
+license = "BSD-3-Clause"
+license-files = ["LICENSE"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: BSD License",
     "Natural Language :: English",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
     "Programming Language :: Rust",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.8",
-    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3 :: Only",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
+    "Programming Language :: Python :: Free Threading :: 2 - Beta",
+    "Programming Language :: Python :: Implementation :: CPython",
     "Topic :: Scientific/Engineering",
-    "Topic :: Utilities",
+    "Topic :: Multimedia :: Graphics :: 3D Modeling",
+    "Typing :: Typed",
 ]
-
-dependencies = [
-    "numpy>=1.20.0",
-]
+dependencies = ["numpy>=1.22"]
 
 [project.optional-dependencies]
-all = ["dxf_io[dev, docs, lint, tests, visualization, examples]"]
-visualization = [
-    "pyvista>=0.40.0",
-    "pymeshfix>=0.16.0",
-]
-manifold = [
-    "manifold3d>=3.0.0",
-]
-examples = ["marimo"]
-dev = ["maturin>=1.5"]
-docs = [
-    "sphinx<9",
-    "pydata-sphinx-theme",
-    "sphinx-rtd-theme",
-]
-tests = [
-    "pytest>=7.0",
-    "pytest-cov",
-    "coverage",
-    "pyvista>=0.40.0",
-    "pymeshfix>=0.16.0",
-]
-lint = [
-    "pre-commit",
-    "pre-commit-hooks",
-    "codespell>=2.1.0",
-    "ruff==0.16.10",
-    "ty==0.0.78",
-]
+visualization = ["pyvista>=0.40"]
+manifold = ["manifold3d>=3.0"]
+all = ["dxf_io[visualization,manifold]"]
 
 [project.urls]
 Homepage = "https://github.com/antoinecollet5/dxf_io"
 Documentation = "https://github.com/antoinecollet5/dxf_io#readme"
 Repository = "https://github.com/antoinecollet5/dxf_io"
 Issues = "https://github.com/antoinecollet5/dxf_io/issues"
-Changelog = "https://github.com/antoinecollet5/dxf_io/releases"
+Changelog = "https://github.com/antoinecollet5/dxf_io/blob/main/CHANGELOG.md"
+
+# Development dependencies (PEP 735): `uv sync` installs the `dev` group by default,
+# `pip install --group dev` works with pip >= 25.1.
+[dependency-groups]
+# PyVista is optional for the tests (it has no wheels for every Python / platform).
+test = ["pytest>=8", "pytest-cov"]
+lint = ["ruff==0.17.6", "ty==0.0.107", "codespell>=2.3", "pre-commit>=4", "pre-commit-hooks>=5"]
+examples = ["marimo", "pyvista>=0.40"]
+dev = ["maturin>=1.9,<2", "pyvista>=0.40", { include-group = "test" }, { include-group = "lint" }]
 
 [tool.maturin]
 python-source = "python"
 module-name = "dxf_io._dxf_io"
 features = ["pyo3/extension-module"]
+# Keep the source distribution lean; tests are included so that it can be tested.
+include = [{ path = "tests/**/*.py", format = "sdist" }]
+exclude = [
+    { path = "**/__pycache__/**", format = "sdist" },
+    { path = ".github/**", format = "sdist" },
+    { path = ".pre-commit-config.yaml", format = "sdist" },
+]
 
 [tool.ruff]
-src = ["python", "tests"]
 line-length = 100
-
-exclude = [
-    ".bzr",
-    ".direnv",
-    ".eggs",
-    ".git",
-    ".hg",
-    ".mypy_cache",
-    ".nox",
-    ".pants.d",
-    ".pytype",
-    ".ruff_cache",
-    ".svn",
-    ".tox",
-    ".venv",
-    "__pypackages__",
-    "_build",
-    "buck-out",
-    "build",
-    "dist",
-    "node_modules",
-    "venv",
-]
+extend-include = ["*.pyi"]
 
 [tool.ruff.lint]
 select = [
-    "F",    # Pyflakes
-    "E",    # pycodestyle errors
-    "W",    # pycodestyle warnings
-    "I",    # isort
+    "E", "W",   # pycodestyle
+    "F",        # pyflakes
+    "I",        # isort
+    "UP",       # pyupgrade
+    "B",        # bugbear
+    "C4",       # comprehensions
+    "SIM",      # simplify
+    "PT",       # pytest style
+    "NPY",      # numpy-specific rules
+    "PERF",     # performance anti-patterns
+    "RUF",      # ruff-specific rules
 ]
-fixable = ["A", "B", "C", "D", "E", "F", "I"]
-unfixable = []
+
+[tool.ruff.lint.per-file-ignores]
+# marimo notebooks: cells return values and re-import names by design.
+"examples/*.py" = ["B018", "RUF005"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["dxf_io"]
 
-
 [tool.ty.src]
-include = ["python", "tests"]
+include = ["python", "tests", "benchmark.py"]
 
 [tool.ty.analysis]
 # Optional dependencies, imported lazily.
-allowed-unresolved-imports = ["manifold3d", "ezdxf"]
+allowed-unresolved-imports = ["manifold3d", "ezdxf", "pyvista"]
+
+[tool.codespell]
+skip = "*.lock,target,.git,*.dxf"
+ignore-words-list = "collet"
 
 [tool.pytest.ini_options]
+minversion = "8.0"
 testpaths = ["tests"]
-python_files = ["test_*.py"]
-addopts = "-v --strict-markers"
-
-[tool.coverage.run]
-source = ["dxf_io"]
-branch = true
-
-[tool.coverage.report]
-exclude_lines = [
-    "pragma: no cover",
-    "def __repr__",
-    "raise AssertionError",
-    "raise NotImplementedError",
-    "if __name__ == .__main__.:",
-    "if TYPE_CHECKING:",
-    "^\\s*@abstractmethod",
-]
+addopts = ["-ra", "--strict-markers", "--strict-config"]
+xfail_strict = true

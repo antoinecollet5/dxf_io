@@ -1,5 +1,5 @@
 """
-dxf_io: Fast Rust-based DXF mesh reader-writer with pyvista and shapely support.
+dxf_io: fast Rust-based DXF mesh reader and writer, with optional PyVista support.
 
 Provides 10-100x speedup over pure Python implementations for large
 mesh files (100K+ faces). Includes optional PyVista integration and
@@ -12,6 +12,8 @@ Basic Usage:
     ...     print(f"Component {i}: {mesh.n_faces} faces")
 """
 
+from importlib import metadata as _metadata
+
 from ._core import (
     MeshWithAttributes,
     diagnose_mesh,
@@ -22,13 +24,16 @@ from ._core import (
     write_dxf_fast,
 )
 
-__version__ = "0.1.0"
+try:
+    __version__ = _metadata.version("dxf_io")
+except _metadata.PackageNotFoundError:  # pragma: no cover - not installed
+    __version__ = "0.0.0"
 __all__ = [
+    "MeshWithAttributes",
     "diagnose_mesh",
     "dxf_to_manifold_meshes",
     "from_manifold3d",
-    "to_manifold3d",
     "parse_dxf_fast",
+    "to_manifold3d",
     "write_dxf_fast",
-    "MeshWithAttributes",
 ]

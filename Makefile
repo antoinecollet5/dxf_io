@@ -1,4 +1,4 @@
-.PHONY: clean clean-test clean-pyc clean-build docs help install-dev
+.PHONY: clean clean-test clean-pyc clean-build help install-dev
 .DEFAULT_GOAL := help
 
 define BROWSER_PYSCRIPT
@@ -38,6 +38,7 @@ clean-pyc: ## remove Python file artifacts
 	find . -name '*.pyo' -exec rm -f {} +
 	find . -name '*~' -exec rm -f {} +
 	find . -name '__pycache__' -exec rm -fr {} + 2>/dev/null || true
+	find . -name '__marimo__' -exec rm -fr {} + 2>/dev/null || true
 
 clean-test: ## remove test and coverage artifacts
 	rm -fr .tox/
@@ -46,44 +47,41 @@ clean-test: ## remove test and coverage artifacts
 	rm -fr .pytest_cache
 	rm -fr .ruff_cache
 
-install-dev: ## install the package in development mode
-	pip install maturin
-	maturin develop -r
+install-dev: ## install the package in development mode (release build)
+	uv sync
+	uv run maturin develop --release
 
-build: clean ## build Rust extension in release mode
-	maturin build --release
+build: clean ## build a release wheel for the current platform
+	uv run maturin build --release
 
-test: ## run tests quickly with the default Python
-	pytest
+test: ## run the Python and Rust tests
+	uv run pytest
+	cargo test --release
 
 test-cov: ## run tests with coverage report
-	pytest --cov=dxf_io --cov-report=html --cov-report=term
+	uv run pytest --cov=dxf_io --cov-report=html --cov-report=term
 	$(BROWSER) htmlcov/index.html
 
-lint: ## run linting with ruff and ty
-	ruff check python tests --fix
-	ruff format python tests
-	ty check .
-	codespell python tests docs README.rst
+lint: ## lint and format-check everything (ruff, ty, codespell, rustfmt, clippy)
+	uv run ruff check .
+	uv run ruff format --check .
+	uv run ty check
+	uv run codespell python tests src README.rst CHANGELOG.md CONTRIBUTING.md
+	cargo fmt --check
+	cargo clippy --all-targets -- -D warnings
 
-docs: ## generate documentation (if available)
-	@echo "Documentation available in README.rst"
+format: ## auto-fix lint issues and format the code
+	uv run ruff check --fix .
+	uv run ruff format .
+	cargo fmt
 
-dist: clean ## builds source and wheel package
-	maturin build --release
-	ls -lh target/wheels/
-
-upload-test: dist ## upload to TestPyPI
-	python -m twine upload --repository testpypi target/wheels/*
-
-upload: dist ## upload to PyPI
-	python -m twine upload target/wheels/*
-
-install-wheel: dist ## install from built wheel
-	pip install target/wheels/*.whl
+dist: clean ## build the sdist and a release wheel for the current platform
+	uv run maturin sdist -o dist
+	uv run maturin build --release -o dist
+	ls -lh dist/
 
 benchmark: ## run performance benchmark
-	python benchmark.py
+	uv run python benchmark.py --synthetic 300
 
-.PHONY: all
+.PHONY: all build test test-cov lint format dist benchmark
 all: clean lint test dist

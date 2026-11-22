@@ -1,0 +1,3801 @@
+diff --git a/.github/dependabot.yml b/.github/dependabot.yml
+new file mode 100644
+index 0000000..50891fb
+--- /dev/null
++++ b/.github/dependabot.yml
+@@ -0,0 +1,17 @@
++version: 2
++updates:
++  - package-ecosystem: github-actions
++    directory: /
++    schedule:
++      interval: monthly
++    groups:
++      actions:
++        patterns: ["*"]
++
++  - package-ecosystem: cargo
++    directory: /
++    schedule:
++      interval: monthly
++    groups:
++      cargo:
++        patterns: ["*"]
+diff --git a/.github/scripts/test-wheels.sh b/.github/scripts/test-wheels.sh
+new file mode 100755
+index 0000000..4e50ca0
+--- /dev/null
++++ b/.github/scripts/test-wheels.sh
+@@ -0,0 +1,28 @@
++#!/usr/bin/env bash
++# Install the wheel built in dist/ for every interpreter of $BUILD_PYTHONS (or $PYTHONS)
++# into a fresh virtual environment, and run the test suite against it.
++set -euo pipefail
++
++pythons="${BUILD_PYTHONS:-$PYTHONS}"
++failed=""
++for version in $pythons; do
++  echo "::group::Python $version"
++  rm -rf .venv-test
++  uv venv -q --managed-python --python "$version" .venv-test
++  if ! uv pip install -q --python .venv-test --only-binary numpy numpy pytest; then
++    echo "::warning::No NumPy wheel for Python $version on this platform: wheel not tested"
++    echo "::endgroup::"
++    continue
++  fi
++  # --no-index: install the wheel just built, never one from PyPI.
++  uv pip install -q --python .venv-test --no-index --no-deps --find-links dist dxf_io
++  if [[ -x .venv-test/bin/python ]]; then py=.venv-test/bin/python; else py=.venv-test/Scripts/python.exe; fi
++  "$py" -m pytest -q -p no:cacheprovider tests || failed="$failed $version"
++  echo "::endgroup::"
++done
++rm -rf .venv-test
++
++if [[ -n "$failed" ]]; then
++  echo "::error::Tests failed for Python$failed"
++  exit 1
++fi
+diff --git a/.github/workflows/main.yml b/.github/workflows/main.yml
+index 4d2ea47..72ee631 100644
+--- a/.github/workflows/main.yml
++++ b/.github/workflows/main.yml
+@@ -2,144 +2,159 @@ name: CI
+ 
+ on:
+   push:
+-    # on every branch
+-    branches:
+-      - '**'
++    branches: ["**"]
++    tags-ignore: ["**"]
++  pull_request:
++  workflow_dispatch:
++
++permissions:
++  contents: read
++
++concurrency:
++  group: ${{ github.workflow }}-${{ github.ref }}
++  cancel-in-progress: true
+ 
+ env:
+-  PIP_CACHE_DIR: ${{ github.workspace }}/.cache/pip
++  CARGO_TERM_COLOR: always
+   RUST_BACKTRACE: 1
++  UV_NO_PROGRESS: 1
+ 
+ jobs:
+-  static_analysis:
+-    runs-on: ubuntu-22.04
++  lint:
++    name: Lint (ruff, ty, codespell, rustfmt, clippy) and Rust tests
++    runs-on: ubuntu-latest
+     steps:
+-      - name: Checkout code
+-        uses: actions/checkout@v7
++      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
++        with:
++          persist-credentials: false
++
++      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
++        with:
++          toolchain: stable
++          components: rustfmt, clippy
++
++      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3 # zizmor: ignore[cache-poisoning] CI only; releases build without caches
++        with:
++          save-if: ${{ github.ref == 'refs/heads/main' }}
+ 
+-      - name: Set up Python
+-        uses: actions/setup-python@v7
++      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
++        id: python
+         with:
+           python-version: "3.13"
+ 
+-      - name: Install Rust
+-        uses: dtolnay/rust-toolchain@stable
++      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+ 
+-      - name: Install dependencies with uv
+-        run: |
+-          pip install uv
+-          uv venv
+-          uv pip install -e ".[dev,tests,lint]"
++      - name: Install the project and the dev tools
++        env:
++          PYTHON: ${{ steps.python.outputs.python-path }}
++        run: uv sync --python "$PYTHON"
+ 
+-      - name: Run pre-commit hooks
+-        run: |
+-          uv run pre-commit run --all-files
++      - name: ruff check
++        run: uv run --no-sync ruff check --output-format=github .
+ 
+-        continue-on-error: false
++      - name: ruff format
++        run: uv run --no-sync ruff format --check --diff .
+ 
+-      - name: Upload pre-commit report
+-        if: ${{ failure() }}
+-        uses: actions/upload-artifact@v7
+-        with:
+-          name: pre-commit-report
+-          path: pre-commit-report
++      - name: ty
++        run: uv run --no-sync ty check --output-format=github
++
++      - name: codespell
++        run: uv run --no-sync codespell python tests src README.rst CHANGELOG.md CONTRIBUTING.md
++
++      - name: rustfmt
++        run: cargo fmt --check
++
++      - name: clippy
++        env:
++          PYO3_PYTHON: ${{ steps.python.outputs.python-path }}
++        run: cargo clippy --all-targets -- -D warnings
++
++      - name: Rust tests
++        env:
++          PYO3_PYTHON: ${{ steps.python.outputs.python-path }}
++        run: |
++          export LD_LIBRARY_PATH="$("$PYO3_PYTHON" -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
++          cargo test --release
+ 
+-  build:
++  test:
++    name: Test ${{ matrix.os }} / Python ${{ matrix.python }}
+     runs-on: ${{ matrix.os }}
+     strategy:
+       fail-fast: false
+       matrix:
+-        os: [ubuntu-22.04, macos-latest, windows-latest]
+-        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13", "3.14"]
+-
++        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
++        python: ["3.10", "3.12", "3.14", "3.15", "3.15t"]
++        include:
++          # Intel macOS and Windows ARM64: newest Python only.
++          - os: macos-15-intel
++            python: "3.15"
++          - os: windows-11-arm
++            python: "3.15"
+     steps:
+-      - uses: actions/checkout@v7
+-
+-      - uses: actions/setup-python@v7
++      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+         with:
+-          python-version: ${{ matrix.python-version }}
++          persist-credentials: false
+ 
+-      - name: Install Rust
+-        uses: dtolnay/rust-toolchain@stable
++      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
++        with:
++          toolchain: stable
+ 
+-      - name: Cache Rust
+-        uses: Swatinem/rust-cache@v2
++      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3 # zizmor: ignore[cache-poisoning] CI only; releases build without caches
++        with:
++          save-if: ${{ github.ref == 'refs/heads/main' }}
+ 
+-      - name: Install uv
+-        run: pip install uv
++      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+ 
+-      - name: Build and install with maturin
++      - name: Build and install (editable, release mode)
++        shell: bash
+         run: |
+-          uv venv
+-          uv pip install -e .[all]
++          uv venv --managed-python --python "${{ matrix.python }}"
++          uv pip install --only-binary numpy -e . --group test
+ 
+-      # For Windows (PowerShell) - ALL backticks for line continuation
+-      - name: Run tests with coverage (Windows)
+-        env:
+-          COVERAGE_FILE: .coverage.${{ matrix.os }}.${{ matrix.python-version }}
+-        if: runner.os == 'Windows'
+-        run: |
+-          uv run pytest `
+-            --cov=dxf_io `
+-            --cov-config=.coveragerc `
+-            --cov-report=term `
+-            --color=yes
+-
+-      # For Linux/macOS (Bash) - ALL backslashes for line continuation
+-      - name: Run tests with coverage (Linux/macOS)
++      - name: Install PyVista (optional, when available for this Python / platform)
++        shell: bash
++        run: uv pip install --only-binary vtk pyvista || echo "::notice::PyVista not available, its tests are skipped"
++
++      - name: Run tests
++        shell: bash
+         env:
+-          COVERAGE_FILE: .coverage.${{ matrix.os }}.${{ matrix.python-version }}
+-        if: runner.os != 'Windows'
+-        run: |
+-          uv run pytest \
+-            --cov=dxf_io \
+-            --cov-config=.coveragerc \
+-            --cov-report=term \
+-            --color=yes
+-
+-      - name: Upload coverage artifact
+-        if: always()
+-        uses: actions/upload-artifact@v7
++          COVERAGE_FILE: .coverage.${{ matrix.os }}.${{ matrix.python }}
++        run: uv run --no-sync pytest --cov=dxf_io --cov-config=.coveragerc --cov-report=term --color=yes
++
++      - name: Upload coverage data
++        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+         with:
+-          name: coverage-${{ matrix.os }}-${{ matrix.python-version }}
+-          path: ${{ github.workspace }}/.coverage.${{ matrix.os }}.${{ matrix.python-version }}
++          name: coverage-${{ matrix.os }}-${{ matrix.python }}
++          path: .coverage.${{ matrix.os }}.${{ matrix.python }}
+           include-hidden-files: true
+           if-no-files-found: error
+ 
+-
+-  coverage-merge:
+-    runs-on: ubuntu-22.04
+-    needs:
+-      - build
+-
+-    if: always()
+-
++  coverage:
++    name: Combine coverage
++    runs-on: ubuntu-latest
++    needs: test
+     steps:
+-      - uses: actions/checkout@v7
+-
+-      - name: Set up Python
+-        uses: actions/setup-python@v7
++      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+         with:
+-          python-version: "3.13"
++          persist-credentials: false
+ 
+-      - name: Install coverage
+-        run: pip install coverage
++      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+ 
+-      - name: Download all coverage artifacts
+-        uses: actions/download-artifact@v7
++      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+         with:
++          pattern: coverage-*
++          merge-multiple: true
+           path: coverage-data
+ 
+       - name: Combine coverage
+         run: |
+-          find coverage-data -name '.coverage*' -print
+-          coverage combine $(find coverage-data -name '.coverage*')
+-          coverage report -m
+-          coverage html
+-          coverage xml
++          uvx coverage combine --rcfile=.coveragerc coverage-data/.coverage.*
++          uvx coverage report --rcfile=.coveragerc -m
++          uvx coverage xml --rcfile=.coveragerc
+ 
+       - name: Upload to Codecov
+-        uses: codecov/codecov-action@v7
++        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+         with:
+           token: ${{ secrets.CODECOV_TOKEN }}
+           files: coverage.xml
++          fail_ci_if_error: false
+diff --git a/.github/workflows/release.yml b/.github/workflows/release.yml
+new file mode 100644
+index 0000000..8af6004
+--- /dev/null
++++ b/.github/workflows/release.yml
+@@ -0,0 +1,217 @@
++name: Release
++
++# Pushing a tag `vX.Y.Z` builds the sdist and the wheels of every platform, tests the
++# wheels, publishes everything to PyPI and creates a GitHub release.
++# Running the workflow manually builds and tests everything without publishing.
++
++on:
++  push:
++    tags: ["v*"]
++  workflow_dispatch:
++
++permissions:
++  contents: read
++
++concurrency:
++  group: ${{ github.workflow }}-${{ github.ref }}
++  cancel-in-progress: false
++
++env:
++  CARGO_TERM_COLOR: always
++  UV_NO_PROGRESS: 1
++  # CPython versions a wheel is built for ("t": free-threaded build).
++  PYTHONS: "3.10 3.11 3.12 3.13 3.14 3.14t 3.15 3.15t"
++
++jobs:
++  sdist:
++    name: Source distribution
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
++        with:
++          persist-credentials: false
++
++      - name: Check that the tag matches the version in Cargo.toml
++        if: startsWith(github.ref, 'refs/tags/')
++        run: |
++          version=$(grep -m1 '^version' Cargo.toml | cut -d '"' -f2)
++          if [ "${GITHUB_REF_NAME}" != "v${version}" ]; then
++            echo "::error::Tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${version}"
++            exit 1
++          fi
++
++      - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
++        with:
++          command: sdist
++          args: --out dist
++
++      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
++
++      - name: Build from the sdist and test
++        run: |
++          uv venv --managed-python --python 3.13
++          uv pip install --only-binary numpy pytest dist/*.tar.gz
++          mkdir sdist-test && tar -xzf dist/*.tar.gz -C sdist-test --strip-components=1
++          cd sdist-test && ../.venv/bin/python -m pytest -q -p no:cacheprovider
++
++      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
++        with:
++          name: dist-sdist
++          path: dist
++
++  linux:
++    name: Wheels linux-${{ matrix.target }}-${{ matrix.libc }}
++    runs-on: ${{ matrix.runner }}
++    strategy:
++      fail-fast: false
++      matrix:
++        include:
++          - { runner: ubuntu-24.04, target: x86_64, libc: gnu, manylinux: auto }
++          - { runner: ubuntu-24.04-arm, target: aarch64, libc: gnu, manylinux: auto }
++          - { runner: ubuntu-24.04, target: x86_64, libc: musl, manylinux: musllinux_1_2 }
++          - { runner: ubuntu-24.04-arm, target: aarch64, libc: musl, manylinux: musllinux_1_2 }
++    steps:
++      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
++        with:
++          persist-credentials: false
++
++      - name: List the interpreters
++        run: echo "INTERPRETERS=$(printf 'python%s ' $PYTHONS)" >> "$GITHUB_ENV"
++
++      - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
++        with:
++          target: ${{ matrix.target }}
++          manylinux: ${{ matrix.manylinux }}
++          args: --release --out dist --interpreter ${{ env.INTERPRETERS }}
++
++      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
++        if: matrix.libc == 'gnu'
++
++      - name: Test the wheels (every Python version)
++        if: matrix.libc == 'gnu'
++        run: bash .github/scripts/test-wheels.sh
++
++      - name: Test the wheels (musl, Alpine)
++        if: matrix.libc == 'musl'
++        run: |
++          docker run --rm -v "$PWD:/io" -w /io python:3.14-alpine sh -euc '
++            pip install --root-user-action=ignore -q --only-binary=:all: numpy pytest
++            pip install --root-user-action=ignore -q --no-index --no-deps --find-links dist dxf_io
++            python -m pytest -q -p no:cacheprovider tests'
++
++      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
++        with:
++          name: dist-linux-${{ matrix.target }}-${{ matrix.libc }}
++          path: dist
++
++  macos-windows:
++    name: Wheels ${{ matrix.platform }}-${{ matrix.target }}
++    runs-on: ${{ matrix.runner }}
++    strategy:
++      fail-fast: false
++      matrix:
++        include:
++          - { runner: macos-15-intel, platform: macos, target: x86_64 }
++          - { runner: macos-latest, platform: macos, target: aarch64 }
++          - { runner: windows-latest, platform: windows, target: x64 }
++          # No CPython 3.10 build exists for Windows ARM64.
++          - runner: windows-11-arm
++            platform: windows
++            target: aarch64
++            pythons: "3.11 3.12 3.13 3.14 3.14t 3.15 3.15t"
++    env:
++      PYTHONS_OVERRIDE: ${{ matrix.pythons }}
++    steps:
++      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
++        with:
++          persist-credentials: false
++
++      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
++
++      - name: Install the interpreters
++        shell: bash
++        run: |
++          pythons="${PYTHONS_OVERRIDE:-$PYTHONS}"
++          echo "BUILD_PYTHONS=$pythons" >> "$GITHUB_ENV"
++          uv python install $pythons
++          paths=$(for v in $pythons; do uv python find --managed-python "$v"; done | tr '\\' '/' | tr '\n' ' ')
++          echo "$paths"
++          echo "INTERPRETERS=$paths" >> "$GITHUB_ENV"
++
++      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
++        with:
++          toolchain: stable
++
++      - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
++        with:
++          target: ${{ matrix.target }}
++          args: --release --out dist --interpreter ${{ env.INTERPRETERS }}
++
++      - name: Test the wheels (every Python version)
++        shell: bash
++        run: bash .github/scripts/test-wheels.sh
++
++      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
++        with:
++          name: dist-${{ matrix.platform }}-${{ matrix.target }}
++          path: dist
++
++  check:
++    name: Check the distributions
++    runs-on: ubuntu-latest
++    needs: [sdist, linux, macos-windows]
++    steps:
++      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
++        with:
++          pattern: dist-*
++          merge-multiple: true
++          path: dist
++
++      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
++
++      - name: Check metadata and list the files
++        run: |
++          uvx twine check --strict dist/*
++          ls -l dist
++          echo "$(ls dist/*.whl | wc -l) wheels"
++
++  publish:
++    name: Publish to PyPI
++    if: startsWith(github.ref, 'refs/tags/v')
++    needs: check
++    runs-on: ubuntu-latest
++    environment:
++      name: pypi
++      url: https://pypi.org/project/dxf_io/
++    permissions:
++      id-token: write  # trusted publishing and attestations
++    steps:
++      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
++        with:
++          pattern: dist-*
++          merge-multiple: true
++          path: dist
++
++      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
++
++  github-release:
++    name: GitHub release
++    needs: publish
++    runs-on: ubuntu-latest
++    permissions:
++      contents: write
++    steps:
++      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
++        with:
++          pattern: dist-*
++          merge-multiple: true
++          path: dist
++
++      - name: Create the release
++        env:
++          GH_TOKEN: ${{ github.token }}
++          GH_REPO: ${{ github.repository }}
++        run: |
++          flags=""
++          case "$GITHUB_REF_NAME" in *[0-9]a[0-9]*|*[0-9]b[0-9]*|*rc*) flags="--prerelease" ;; esac
++          gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --generate-notes $flags
+diff --git a/.pre-commit-config.yaml b/.pre-commit-config.yaml
+index 4ebad35..2da98df 100644
+--- a/.pre-commit-config.yaml
++++ b/.pre-commit-config.yaml
+@@ -1,68 +1,74 @@
+-#!/bin/bash
+-
++# Hooks use the tools installed in the project environment (`uv sync`).
+ repos:
+ - repo: local
+   hooks:
+   - id: check-json
+     name: check json
+-    description: checks json files for parseable syntax.
+     entry: check-json
+-    language: python
++    language: system
+     types: [json]
+ 
+   - id: check-toml
+     name: check toml
+-    description: checks toml files for parseable syntax.
+     entry: check-toml
+-    language: python
++    language: system
+     types: [toml]
+ 
+   - id: check-yaml
+     name: check yaml
+-    description: checks yaml files for parseable syntax.
+     entry: check-yaml
+-    language: python
++    language: system
+     types: [yaml]
+ 
+   - id: end-of-file-fixer
+     name: fix end of files
+-    description: ensures that a file is either empty, or ends with one newline.
+     entry: end-of-file-fixer
+-    language: python
++    language: system
+     types: [text]
+     stages: [pre-commit, pre-push, manual]
+ 
+   - id: trailing-whitespace
+     name: trim trailing whitespace
+-    description: trims trailing whitespace.
+     entry: trailing-whitespace-fixer
+-    language: python
++    language: system
+     types: [text]
+     stages: [pre-commit, pre-push, manual]
+ 
+   - id: codespell
+     name: codespell
+-    description: Checks for common misspellings in text files.
+     entry: codespell
+-    language: python
+-    types: [python, rst, markdown]
+-    args: ["python", "tests", "docs"]
++    language: system
++    types_or: [python, rst, markdown, rust]
+ 
+-  - id: ruff check
++  - id: ruff-check
+     name: ruff check
+     entry: ruff check
+-    language: python
++    language: system
+     types_or: [python, pyi]
+     args: [--fix, --exit-non-zero-on-fix]
+ 
+   - id: ruff-format
+     name: ruff format
+     entry: ruff format
+-    language: python
++    language: system
+     types_or: [python, pyi]
+ 
+   - id: ty
+     name: ty check
+-    entry: ty check .
++    entry: ty check
+     language: system
+     types_or: [python, pyi]
++    pass_filenames: false
++
++  - id: cargo-fmt
++    name: cargo fmt
++    entry: cargo fmt --
++    language: system
++    types: [rust]
++
++  - id: cargo-clippy
++    name: cargo clippy
++    entry: cargo clippy --all-targets -- -D warnings
++    language: system
++    types: [rust]
++    pass_filenames: false
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+new file mode 100644
+index 0000000..2ddbe99
+--- /dev/null
++++ b/CHANGELOG.md
+@@ -0,0 +1,20 @@
++# Changelog
++
++All notable changes to this project are documented here. The format follows
++[Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
++[Semantic Versioning](https://semver.org/).
++
++## [0.1.0] - Unreleased
++
++First public release.
++
++### Added
++- Parallel, GIL-free parsing of `SOLID` / `3DFACE` entities of ASCII DXF files
++  (`parse_dxf_fast`), with vertex merging and connected-component labelling.
++- Parallel DXF writer (`write_dxf_fast`, `MeshWithAttributes.to_dxf`), to a string or
++  streamed to a file.
++- `dxf_to_manifold_meshes` to split a file into its connected components, as
++  `MeshWithAttributes` or `pyvista.PolyData` objects.
++- Conversion to and from `manifold3d`.
++- Wheels for Linux, macOS and Windows (x86_64 and ARM64), CPython 3.10 to 3.15,
++  including free-threaded builds.
+diff --git a/CONTRIBUTING.md b/CONTRIBUTING.md
+index eb34416..8f4afce 100644
+--- a/CONTRIBUTING.md
++++ b/CONTRIBUTING.md
+@@ -2,49 +2,56 @@
+ 
+ Thank you for your interest in contributing!
+ 
+-## Development Setup
++## Development setup
++
++You need a [Rust toolchain](https://rustup.rs) and [uv](https://docs.astral.sh/uv/).
+ 
+ ```bash
+-# Clone the repository
+ git clone https://github.com/antoinecollet5/dxf_io
+ cd dxf_io
++uv sync                 # builds the extension (editable) and installs the dev tools
++uv run pre-commit install
++```
+ 
+-# Install Rust (if not already installed)
+-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+-
+-# Install development dependencies
+-make install-dev
++After changing Rust code, rebuild with `uv run maturin develop --release`
++(or `make install-dev`).
+ 
+-# Run tests
+-make test
++## Checks
+ 
+-# Run linting
+-make lint
++```bash
++make lint               # ruff check, ruff format, ty, codespell, rustfmt, clippy
++make test               # pytest + cargo test
++make benchmark          # timings on a synthetic file
+ ```
+ 
+-## Making Changes
++CI runs the same checks on Linux, macOS and Windows for every supported Python version.
+ 
+-1. Create a new branch: `git checkout -b feature/your-feature`
+-2. Make your changes
+-3. Run linting: `make lint`
+-4. Run tests: `make test`
+-5. Commit with descriptive message
+-6. Push and open a Pull Request
++## Code style
+ 
+-## Code Style
++- Python: formatted and linted with `ruff`, type-checked with `ty`.
++- Rust: `cargo fmt` and `cargo clippy -- -D warnings`.
++- New features come with tests (`tests/` for Python, `#[cfg(test)]` in `src/lib.rs`
++  for Rust internals).
+ 
+-- Python: Use `ruff` for formatting and linting
+-- Rust: Use `rustfmt` (configured in `Cargo.toml`)
+-- Type hints: Use `ty` for type checking
++## Releasing
+ 
+-## Testing
++The version lives in `Cargo.toml` only (`pyproject.toml` and `dxf_io.__version__`
++read it).
+ 
+-Always include tests for new features:
++1. Bump `version` in `Cargo.toml`, run `cargo check` to update `Cargo.lock`, and move
++   the "Unreleased" entries of `CHANGELOG.md` under the new version.
++2. Commit, then tag and push: `git tag v0.2.0 && git push origin main v0.2.0`.
++3. The `Release` workflow builds the sdist and the wheels for every platform, tests the
++   wheels, publishes them to PyPI (trusted publishing) and creates a GitHub release.
+ 
+-```bash
+-pytest -v tests/
+-```
++One-time PyPI setup: on <https://pypi.org/manage/account/publishing/>, add a pending
++trusted publisher with owner `antoinecollet5`, repository `dxf_io`, workflow
++`release.yml` and environment `pypi`; then create the `pypi` environment in the GitHub
++repository settings (optionally with required reviewers).
++
++To try the pipeline first, run the `Release` workflow manually (Actions tab, "Run
++workflow"): it builds and tests everything without publishing.
+ 
+-## Reporting Issues
++## Reporting issues
+ 
+ Use GitHub Issues to report bugs or suggest features.
+diff --git a/Cargo.toml b/Cargo.toml
+index a715977..9c35386 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -2,9 +2,20 @@
+ name = "dxf_io"
+ version = "0.1.0"
+ edition = "2021"
++description = "Fast Rust-based DXF mesh reader-writer for Python."
++license = "BSD-3-Clause"
++repository = "https://github.com/antoinecollet5/dxf_io"
++readme = "README.rst"
++publish = false
++
++[lib]
++name = "_dxf_io"
++crate-type = ["cdylib"]
+ 
+ [dependencies]
+-pyo3 = { version = "0.29", features = ["extension-module"] }
++# `extension-module` is enabled by maturin (see pyproject.toml), not here, so that
++# `cargo test` can link against libpython.
++pyo3 = "0.29"
+ numpy = "0.29"
+ ndarray = "0.16"
+ rustc-hash = "2.1"
+@@ -12,12 +23,8 @@ rayon = "1.10"
+ memchr = "2.7"
+ fast-float2 = "0.2"
+ 
+-
+ [profile.release]
+ opt-level = 3
+-lto = true
++lto = "fat"
+ codegen-units = 1
+-
+-[lib]
+-name = "_dxf_io"
+-crate-type = ["cdylib"]
++strip = true
+diff --git a/MANIFEST.in b/MANIFEST.in
+deleted file mode 100644
+index 311ecd7..0000000
+--- a/MANIFEST.in
++++ /dev/null
+@@ -1,8 +0,0 @@
+-include README.rst
+-include LICENSE
+-include Makefile
+-recursive-include src *.rs
+-recursive-include python *.py *.pyi py.typed
+-recursive-include tests *.py
+-recursive-include examples *.py
+-recursive-include .github/workflows *.yml
+diff --git a/Makefile b/Makefile
+index 6561312..8bd8f85 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,4 +1,4 @@
+-.PHONY: clean clean-test clean-pyc clean-build docs help install-dev
++.PHONY: clean clean-test clean-pyc clean-build help install-dev
+ .DEFAULT_GOAL := help
+ 
+ define BROWSER_PYSCRIPT
+@@ -38,6 +38,7 @@ clean-pyc: ## remove Python file artifacts
+ 	find . -name '*.pyo' -exec rm -f {} +
+ 	find . -name '*~' -exec rm -f {} +
+ 	find . -name '__pycache__' -exec rm -fr {} + 2>/dev/null || true
++	find . -name '__marimo__' -exec rm -fr {} + 2>/dev/null || true
+ 
+ clean-test: ## remove test and coverage artifacts
+ 	rm -fr .tox/
+@@ -46,44 +47,41 @@ clean-test: ## remove test and coverage artifacts
+ 	rm -fr .pytest_cache
+ 	rm -fr .ruff_cache
+ 
+-install-dev: ## install the package in development mode
+-	pip install maturin
+-	maturin develop -r
++install-dev: ## install the package in development mode (release build)
++	uv sync
++	uv run maturin develop --release
+ 
+-build: clean ## build Rust extension in release mode
+-	maturin build --release
++build: clean ## build a release wheel for the current platform
++	uv run maturin build --release
+ 
+-test: ## run tests quickly with the default Python
+-	pytest
++test: ## run the Python and Rust tests
++	uv run pytest
++	cargo test --release
+ 
+ test-cov: ## run tests with coverage report
+-	pytest --cov=dxf_io --cov-report=html --cov-report=term
++	uv run pytest --cov=dxf_io --cov-report=html --cov-report=term
+ 	$(BROWSER) htmlcov/index.html
+ 
+-lint: ## run linting with ruff and ty
+-	ruff check python tests --fix
+-	ruff format python tests
+-	ty check .
+-	codespell python tests docs README.rst
++lint: ## lint and format-check everything (ruff, ty, codespell, rustfmt, clippy)
++	uv run ruff check .
++	uv run ruff format --check .
++	uv run ty check
++	uv run codespell python tests src README.rst CHANGELOG.md CONTRIBUTING.md
++	cargo fmt --check
++	cargo clippy --all-targets -- -D warnings
+ 
+-docs: ## generate documentation (if available)
+-	@echo "Documentation available in README.rst"
++format: ## auto-fix lint issues and format the code
++	uv run ruff check --fix .
++	uv run ruff format .
++	cargo fmt
+ 
+-dist: clean ## builds source and wheel package
+-	maturin build --release
+-	ls -lh target/wheels/
+-
+-upload-test: dist ## upload to TestPyPI
+-	python -m twine upload --repository testpypi target/wheels/*
+-
+-upload: dist ## upload to PyPI
+-	python -m twine upload target/wheels/*
+-
+-install-wheel: dist ## install from built wheel
+-	pip install target/wheels/*.whl
++dist: clean ## build the sdist and a release wheel for the current platform
++	uv run maturin sdist -o dist
++	uv run maturin build --release -o dist
++	ls -lh dist/
+ 
+ benchmark: ## run performance benchmark
+-	python benchmark.py
++	uv run python benchmark.py --synthetic 300
+ 
+-.PHONY: all
++.PHONY: all build test test-cov lint format dist benchmark
+ all: clean lint test dist
+diff --git a/README.rst b/README.rst
+index 66b50fc..5880b93 100644
+--- a/README.rst
++++ b/README.rst
+@@ -4,24 +4,77 @@ dxf_io
+ 
+ |License| |Python| |PyPI| |Build Status| |codecov| |Ruff| |ty|
+ 
+-🚀 **Fast Rust-based DXF mesh reader-writer with pyvista and shapely support.** — 10–100x speedup over pure Python (ezdxf).
++🚀 **Fast Rust-based DXF mesh reader and writer, with optional PyVista support** — 10–100x faster than pure Python (ezdxf).
++
++``dxf_io`` reads the ``SOLID`` and ``3DFACE`` entities of ASCII DXF files into NumPy
++arrays (merging duplicate vertices and finding connected components), and writes
++triangle meshes back as ``3DFACE`` entities.
+ 
+ **The complete documentation can be found here**: `GitHub Repository <https://github.com/antoinecollet5/dxf_io>`_.
+ 
++===============
++📦 Installation
++===============
++
++Pre-built wheels are available for Linux (x86_64, aarch64; glibc and musl), macOS
++(Intel and Apple Silicon) and Windows (x64, ARM64), for CPython 3.10 to 3.15, including
++free-threaded builds:
++
++.. code-block:: bash
++
++    pip install dxf_io                  # NumPy only
++    pip install "dxf_io[visualization]" # + PyVista
++    pip install "dxf_io[all]"           # + PyVista and manifold3d
++
++Installing from source requires a `Rust toolchain <https://rustup.rs>`_.
++
++==============
++🧭 Quick start
++==============
++
++.. code-block:: python
++
++    from dxf_io import dxf_to_manifold_meshes, parse_dxf_fast, write_dxf_fast
++
++    # Raw arrays: points (N, 3) float64, faces (M, 3) and labels (N,) intp.
++    mesh = parse_dxf_fast("model.dxf", decimals=6)
++    print(mesh["points"].shape, mesh["faces"].shape)
++
++    # One mesh per connected component (pyvista.PolyData if PyVista is installed).
++    parts = dxf_to_manifold_meshes("model.dxf", use_pyvista=False)
++    for part in parts:
++        print(part.n_points, part.n_faces)
++
++    # Write a triangle mesh (to a file, or to a string when no file is given).
++    write_dxf_fast(mesh["points"], mesh["faces"], "out.dxf")
+ 
+ ===============
+ ⚡ Performance
+ ===============
+ 
+-Parsing and writing run in Rust, use all the available cores and release the GIL.
+-On a 190 MB file (4 million vertices, 2 million triangles), parsing takes under a second
+-and writing about one second on a 2-core machine. On a 16 MB file, ``dxf_io`` is about
+-100x faster than `ezdxf <https://ezdxf.mozman.at>`_ at merely reading and iterating the
+-faces (and it also merges the vertices and finds the connected components).
++Parsing, vertex merging and writing run in Rust, use all the available cores and release
++the GIL. On a 67 MB file (360,000 vertices, 720,000 triangles), parsing takes about
++0.15 s and writing about 0.2 s on a 2-core machine, about 65x faster than
++`ezdxf <https://ezdxf.mozman.at>`_ merely reading and iterating the faces (``dxf_io``
++also merges the vertices and finds the connected components). Splitting a mesh into its
++components is linear in its size, whatever the number of components.
+ 
+-Reproduce with ``python benchmark.py --synthetic 150 --ezdxf`` after
++Reproduce with ``python benchmark.py --synthetic 300 --ezdxf`` after
+ ``maturin develop --release``.
+ 
++==============
++🛠️ Development
++==============
++
++.. code-block:: bash
++
++    uv sync                               # builds the extension, installs dev tools
++    uv run pytest && cargo test           # Python and Rust tests
++    uv run ruff check . && uv run ruff format --check . && uv run ty check
++
++See `CONTRIBUTING.md <https://github.com/antoinecollet5/dxf_io/blob/main/CONTRIBUTING.md>`_
++for the release process.
++
+ ===========
+ 🔑 License
+ ===========
+@@ -73,7 +126,7 @@ Contributions are welcome!
+     :target: https://pypi.org/project/dxf_io/
+     :alt: PyPI
+ 
+-.. |Build Status| image:: https://github.com/antoinecollet5/dxf_io/workflows/CI/badge.svg
++.. |Build Status| image:: https://github.com/antoinecollet5/dxf_io/actions/workflows/main.yml/badge.svg
+     :target: https://github.com/antoinecollet5/dxf_io/actions/workflows/main.yml
+     :alt: Build Status
+ 
+diff --git a/dxf_io_optim.patch b/dxf_io_optim.patch
+deleted file mode 100644
+index 19cfca4..0000000
+--- a/dxf_io_optim.patch
++++ /dev/null
+@@ -1,1472 +0,0 @@
+-diff --git a/Cargo.lock b/Cargo.lock
+-index 31a0ac6..719ec51 100644
+---- a/Cargo.lock
+-+++ b/Cargo.lock
+-@@ -8,16 +8,56 @@ version = "1.5.1"
+- source = "registry+https://github.com/rust-lang/crates.io-index"
+- checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
+- 
+-+[[package]]
+-+name = "crossbeam-deque"
+-+version = "0.8.8"
+-+source = "registry+https://github.com/rust-lang/crates.io-index"
+-+checksum = "622f3fc73690be383c7214310406f28a90e6edeadc3cea882f9d71e495b9711a"
+-+dependencies = [
+-+ "crossbeam-epoch",
+-+ "crossbeam-utils",
+-+]
+-+
+-+[[package]]
+-+name = "crossbeam-epoch"
+-+version = "0.9.21"
+-+source = "registry+https://github.com/rust-lang/crates.io-index"
+-+checksum = "dc74980687109a3b14c72fd458107bf0baa1da1a1a805e178d15501ba9b86d9d"
+-+dependencies = [
+-+ "crossbeam-utils",
+-+]
+-+
+-+[[package]]
+-+name = "crossbeam-utils"
+-+version = "0.8.23"
+-+source = "registry+https://github.com/rust-lang/crates.io-index"
+-+checksum = "a31eee39dddec8330830986fcd7625edb5a24ec90ea038215273bbc3adb08ac6"
+-+
+- [[package]]
+- name = "dxf_io"
+- version = "0.1.0"
+- dependencies = [
+-+ "fast-float2",
+-+ "memchr",
+-  "ndarray",
+-  "numpy",
+-  "pyo3",
+-+ "rayon",
+-  "rustc-hash",
+- ]
+- 
+-+[[package]]
+-+name = "either"
+-+version = "1.19.0"
+-+source = "registry+https://github.com/rust-lang/crates.io-index"
+-+checksum = "0e9c71c2167ca323c882b99918929403426e2373ea17242ff5653e0d5e1058be"
+-+
+-+[[package]]
+-+name = "fast-float2"
+-+version = "0.2.4"
+-+source = "registry+https://github.com/rust-lang/crates.io-index"
+-+checksum = "c6e8948ce679d00a02a94739ea185595dca7118ed04feb991127e443bd3d761f"
+-+
+- [[package]]
+- name = "heck"
+- version = "0.5.0"
+-@@ -40,6 +80,12 @@ dependencies = [
+-  "rawpointer",
+- ]
+- 
+-+[[package]]
+-+name = "memchr"
+-+version = "2.8.3"
+-+source = "registry+https://github.com/rust-lang/crates.io-index"
+-+checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
+-+
+- [[package]]
+- name = "ndarray"
+- version = "0.16.1"
+-@@ -200,6 +246,26 @@ version = "0.2.1"
+- source = "registry+https://github.com/rust-lang/crates.io-index"
+- checksum = "60a357793950651c4ed0f3f52338f53b2f809f32d83a07f72909fa13e4c6c1e3"
+- 
+-+[[package]]
+-+name = "rayon"
+-+version = "1.12.0"
+-+source = "registry+https://github.com/rust-lang/crates.io-index"
+-+checksum = "fb39b166781f92d482534ef4b4b1b2568f42613b53e5b6c160e24cfbfa30926d"
+-+dependencies = [
+-+ "either",
+-+ "rayon-core",
+-+]
+-+
+-+[[package]]
+-+name = "rayon-core"
+-+version = "1.13.0"
+-+source = "registry+https://github.com/rust-lang/crates.io-index"
+-+checksum = "22e18b0f0062d30d4230b2e85ff77fdfe4326feb054b9783a3460d8435c8ab91"
+-+dependencies = [
+-+ "crossbeam-deque",
+-+ "crossbeam-utils",
+-+]
+-+
+- [[package]]
+- name = "rustc-hash"
+- version = "2.1.3"
+-diff --git a/Cargo.toml b/Cargo.toml
+-index 7d9d27d..a715977 100644
+---- a/Cargo.toml
+-+++ b/Cargo.toml
+-@@ -8,6 +8,9 @@ pyo3 = { version = "0.29", features = ["extension-module"] }
+- numpy = "0.29"
+- ndarray = "0.16"
+- rustc-hash = "2.1"
+-+rayon = "1.10"
+-+memchr = "2.7"
+-+fast-float2 = "0.2"
+- 
+- 
+- [profile.release]
+-diff --git a/README.rst b/README.rst
+-index 0956df1..4766d15 100644
+---- a/README.rst
+-+++ b/README.rst
+-@@ -9,6 +9,19 @@ dxf_io
+- **The complete documentation can be found here**: `GitHub Repository <https://github.com/antoinecollet5/dxf_io>`_.
+- 
+- 
+-+===============
+-+⚡ Performance
+-+===============
+-+
+-+Parsing and writing run in Rust, use all the available cores and release the GIL.
+-+On a 190 MB file (4 million vertices, 2 million triangles), parsing takes under a second
+-+and writing about one second on a 2-core machine. On a 16 MB file, ``dxf_io`` is about
+-+100x faster than `ezdxf <https://ezdxf.mozman.at>`_ at merely reading and iterating the
+-+faces (and it also merges the vertices and finds the connected components).
+-+
+-+Reproduce with ``python benchmark.py --synthetic 150 --ezdxf`` after
+-+``maturin develop --release``.
+-+
+- ===========
+- 🔑 License
+- ===========
+-diff --git a/benchmark.py b/benchmark.py
+-index 280e4ae..e4f20e3 100644
+---- a/benchmark.py
+-+++ b/benchmark.py
+-@@ -1,135 +1,104 @@
+- #!/usr/bin/env python3
+--"""
+--Benchmark: Pure Python vs. Rust + PyO3
+-+"""Time every stage of dxf_io on a DXF file (or on a synthetic one).
+-+
+-+Usage::
+- 
+--Compares performance of dxf_io.py (pure Python) vs.
+--dxf_io_wrapper.py (Rust + PyO3 bindings).
+-+    python benchmark.py model.dxf
+-+    python benchmark.py --synthetic 500          # 4 grids of 500 x 500 quads (~190 MB)
+-+    python benchmark.py model.dxf --ezdxf        # also time ezdxf (pip install ezdxf)
+- 
+--Run with:
+--    python benchmark.py <path_to_dxf_file>
+-+Build the extension in release mode first: ``maturin develop --release``.
+- """
+- 
+--import sys
+-+from __future__ import annotations
+-+
+-+import argparse
+-+import tempfile
+- import time
+-+from collections.abc import Callable
+- from pathlib import Path
+--from typing import Tuple
+--
+--import numpy as np
+--
+--
+--def bench_parse(func, dxf_file: str, decimals: int = 6, n_runs: int = 3) -> Tuple[float, dict]:
+--    """Run parser n times, return median time and result."""
+--    times = []
+--    result = None
+--
+--    for i in range(n_runs):
+-+from typing import Any
+-+
+-+from dxf_io import dxf_to_manifold_meshes, parse_dxf_fast, write_dxf_fast
+-+
+-+
+-+def make_synthetic(n: int, path: Path, parts: int = 4) -> None:
+-+    """Write ``parts`` disjoint n x n grids of 3DFACE quads."""
+-+    with open(path, "w", encoding="utf-8") as f:
+-+        f.write("  0\nSECTION\n  2\nENTITIES\n")
+-+        for part in range(parts):
+-+            off = part * (n + 5)
+-+            for i in range(n):
+-+                for j in range(n):
+-+                    x, y, z = off + i * 0.5, j * 0.5, 0.1 * part
+-+                    corners = [(x, y), (x + 0.5, y), (x + 0.5, y + 0.5), (x, y + 0.5)]
+-+                    f.write("  0\n3DFACE\n  8\n0\n")
+-+                    for k, (cx, cy) in enumerate(corners):
+-+                        f.write(f" {10 + k}\n{cx:.6f}\n {20 + k}\n{cy:.6f}\n {30 + k}\n{z:.6f}\n")
+-+        f.write("  0\nENDSEC\n  0\nEOF\n")
+-+
+-+
+-+def timed(
+-+    label: str, func: Callable[..., Any], *args: Any, repeat: int = 3, **kwargs: Any
+-+) -> tuple[float, Any]:
+-+    """Run ``func`` ``repeat`` times, print the best time and return ``(best, result)``."""
+-+    best, result = float("inf"), None
+-+    for _ in range(repeat):
+-         t0 = time.perf_counter()
+--        result = func(dxf_file, decimals)
+--        t1 = time.perf_counter()
+--        times.append(t1 - t0)
+--        print(f"  Run {i + 1}/{n_runs}: {times[-1]:.3f}s", flush=True)
+--
+--    times.sort()
+--    median_time = times[n_runs // 2]
+--
+--    stats = {
+--        "min": min(times),
+--        "median": median_time,
+--        "max": max(times),
+--        "mean": np.mean(times),
+--        "n_points": int(result.points.shape[0]) if hasattr(result, "points") else None,
+--        "n_faces": int(result.faces.shape[0]) if hasattr(result, "faces") else None,
+--        "n_components": int(result.n_components) if hasattr(result, "n_components") else None,
+--    }
+--    return median_time, stats
+--
+--
+--def main():
+--    if len(sys.argv) < 2:
+--        print("Usage: python benchmark.py <dxf_file>")
+--        print("Example: python benchmark.py model.dxf")
+--        sys.exit(1)
+--
+--    dxf_file = sys.argv[1]
+--    if not Path(dxf_file).exists():
+--        print(f"Error: File not found: {dxf_file}")
+--        sys.exit(1)
+--
+--    file_size_mb = Path(dxf_file).stat().st_size / (1024 * 1024)
+--    print(f"Benchmarking: {dxf_file} ({file_size_mb:.1f} MB)\n")
+--
+--    # Test 1: Import and benchmark Rust version
+--    print("=" * 60)
+--    print("RUST + PyO3 (dxf_io_wrapper)")
+--    print("=" * 60)
+--    try:
+--        from dxf_io import parse_dxf_fast as rust_parse
+--
+--        print("Parsing (3 runs)...")
+--        rust_time, rust_stats = bench_parse(rust_parse, dxf_file, n_runs=3)
+--
+--        print("\nResults:")
+--        print(f"  Points: {rust_stats['n_points']}")
+--        print(f"  Faces: {rust_stats['n_faces']}")
+--        print(f"  Components: {rust_stats['n_components']}")
+-+        result = func(*args, **kwargs)
+-+        best = min(best, time.perf_counter() - t0)
+-+    print(f"  {label:<34s} {best:8.3f} s")
+-+    return best, result
+-+
+-+
+-+def bench_ezdxf(path: Path) -> float:
+-+    """Time ezdxf reading the file and iterating over its faces (no vertex merging)."""
+-+    import ezdxf
+-+
+-+    t0 = time.perf_counter()
+-+    msp = ezdxf.readfile(str(path)).modelspace()
+-+    faces: Any = msp.query("3DFACE SOLID")
+-+    for entity in faces:
+-+        entity.wcs_vertices()
+-+    return time.perf_counter() - t0
+-+
+-+
+-+def main() -> None:
+-+    parser = argparse.ArgumentParser(
+-+        description=__doc__, formatter_class=argparse.RawTextHelpFormatter
+-+    )
+-+    parser.add_argument("dxf_file", nargs="?", type=Path, help="DXF file to benchmark")
+-+    parser.add_argument("--synthetic", type=int, metavar="N", help="generate N x N grids instead")
+-+    parser.add_argument("--ezdxf", action="store_true", help="also time ezdxf (slow on big files)")
+-+    args = parser.parse_args()
+-+
+-+    with tempfile.TemporaryDirectory() as tmp:
+-+        if args.synthetic:
+-+            path = Path(tmp) / "synthetic.dxf"
+-+            print(f"Generating a synthetic file ({args.synthetic} x {args.synthetic} x 4 quads)...")
+-+            make_synthetic(args.synthetic, path)
+-+        elif args.dxf_file is not None and args.dxf_file.exists():
+-+            path = args.dxf_file
+-+        else:
+-+            parser.error("give an existing DXF file, or --synthetic N")
+-+
+-+        print(f"\n{path.name}: {path.stat().st_size / 1e6:.1f} MB\n")
+-+        _, data = timed("parse_dxf_fast", parse_dxf_fast, path)
+-+        n_comp = int(data["labels"].max()) + 1 if len(data["labels"]) else 0
+-         print(
+--            f"  Time: {rust_time:.3f}s (min={rust_stats['min']:.3f}, max={rust_stats['max']:.3f})"
+-+            f"    -> {len(data['points'])} points, {len(data['faces'])} faces, {n_comp} components"
+-         )
+--
+--    except ImportError as e:
+--        print(f"⚠️  Rust version not available: {e}")
+--        print("   Run: maturin develop -r\n")
+--        rust_time = None
+--        rust_stats = None
+--
+--    # Test 2: Import and benchmark pure Python version
+--    print("\n" + "=" * 60)
+--    print("PURE PYTHON (dxf_io.dxf_to_manifold_meshes)")
+--    print("=" * 60)
+--    try:
+--        from dxf_io import dxf_to_manifold_meshes as python_parse
+--
+--        print("Parsing (1 run, may be slow)...")
+--
+--        t0 = time.perf_counter()
+--        py_meshes = python_parse(dxf_file, decimals=6)
+--        python_time = time.perf_counter() - t0
+--
+--        py_n_points = sum(m.n_points for m in py_meshes)
+--        py_n_faces = sum(m.n_faces for m in py_meshes)
+--
+--        print("\nResults:")
+--        print(f"  Points: {py_n_points}")
+--        print(f"  Faces: {py_n_faces}")
+--        print(f"  Components: {len(py_meshes)}")
+--        print(f"  Time: {python_time:.3f}s")
+--
+--    except ImportError as e:
+--        print(f"⚠️  Pure Python version not available: {e}")
+--        print("   Ensure dxf_io.py is in PYTHONPATH\n")
+--        python_time = None
+--
+--    # Comparison
+--    print("\n" + "=" * 60)
+--    print("COMPARISON")
+--    print("=" * 60)
+--
+--    if rust_time and python_time:
+--        speedup = python_time / rust_time
+--        print(f"Rust: {rust_time:.3f}s")
+--        print(f"Python: {python_time:.3f}s")
+--        print(f"Speedup: {speedup:.1f}x faster with Rust\n")
+--
+--        if rust_stats and abs(rust_stats["n_faces"] - py_n_faces) > 0:
+--            print(f"⚠️  Face count mismatch: Rust={rust_stats['n_faces']}, Python={py_n_faces}")
+--        else:
+--            print("✅ Results match between implementations")
+--    elif rust_time:
+--        print(f"Rust: {rust_time:.3f}s")
+--        print("(Python version not available for comparison)")
+--    elif python_time:
+--        print(f"Python: {python_time:.3f}s")
+--        print("(Rust version not available for comparison)")
+-+        timed("dxf_to_manifold_meshes", dxf_to_manifold_meshes, path, use_pyvista=False)
+-+        timed("write_dxf_fast -> str", write_dxf_fast, data["points"], data["faces"])
+-+        out = Path(tmp) / "out.dxf"
+-+        timed("write_dxf_fast -> file", write_dxf_fast, data["points"], data["faces"], out)
+-+
+-+        if args.ezdxf:
+-+            print()
+-+            t_ezdxf = bench_ezdxf(path)
+-+            t_dxf_io, _ = timed("parse_dxf_fast (again)", parse_dxf_fast, path)
+-+            print(f"  {'ezdxf (read + iterate faces)':<34s} {t_ezdxf:8.3f} s")
+-+            print(f"\n  dxf_io is {t_ezdxf / t_dxf_io:.0f}x faster than ezdxf")
+- 
+- 
+- if __name__ == "__main__":
+-diff --git a/pyproject.toml b/pyproject.toml
+-index e51f484..3d0baa8 100644
+---- a/pyproject.toml
+-+++ b/pyproject.toml
+-@@ -122,8 +122,8 @@ known-first-party = ["dxf_io"]
+- include = ["python", "tests"]
+- 
+- [tool.ty.analysis]
+--# Optional dependency, imported lazily.
+--allowed-unresolved-imports = ["manifold3d"]
+-+# Optional dependencies, imported lazily.
+-+allowed-unresolved-imports = ["manifold3d", "ezdxf"]
+- 
+- [tool.pytest.ini_options]
+- testpaths = ["tests"]
+-diff --git a/python/dxf_io/_core.py b/python/dxf_io/_core.py
+-index a09c03e..445f854 100644
+---- a/python/dxf_io/_core.py
+-+++ b/python/dxf_io/_core.py
+-@@ -7,7 +7,7 @@ connected-component extraction, and optional PyVista / manifold3d conversion.
+- from __future__ import annotations
+- 
+- import os
+--from typing import TYPE_CHECKING, Any, Optional, Union
+-+from typing import TYPE_CHECKING, Any, Optional, Union, overload
+- 
+- import numpy as np
+- 
+-@@ -31,7 +31,8 @@ def parse_dxf_fast(
+-     """Parse the SOLID and 3DFACE entities of an ASCII DXF file.
+- 
+-     Quads are split into two triangles, and vertices that are equal once rounded to
+--    ``decimals`` places are merged.
+-+    ``decimals`` places are merged. Files are read and parsed in Rust, using all the
+-+    available cores, without holding the GIL.
+- 
+-     Parameters
+-     ----------
+-@@ -47,24 +48,27 @@ def parse_dxf_fast(
+-         the connected-component id of each point.
+-     """
+-     if isinstance(dxf_file, str) and "\n" in dxf_file:
+--        content = dxf_file
+-+        points, faces, labels = _rs.parse_dxf_bytes(dxf_file.encode("utf-8"), decimals)
+-     else:
+--        with open(os.fspath(dxf_file), encoding="utf-8", errors="replace") as f:
+--            content = f.read()
+--
+--    raw = _rs.parse_dxf_fast(content, decimals)
+-+        points, faces, labels = _rs.parse_dxf_file(dxf_file, decimals)
+-     return {
+--        "points": raw.points_array().astype(np.float64),
+--        "faces": raw.faces_array().astype(np.intp),
+--        "labels": raw.labels_array().astype(np.intp),
+-+        "points": points,
+-+        "faces": faces.astype(np.intp, copy=False),
+-+        "labels": labels.astype(np.intp, copy=False),
+-     }
+- 
+- 
+-+@overload
+-+def write_dxf_fast(points: np.ndarray, faces: np.ndarray, output_file: None = None) -> str: ...
+-+@overload
+-+def write_dxf_fast(
+-+    points: np.ndarray, faces: np.ndarray, output_file: Union[str, "os.PathLike[str]"]
+-+) -> None: ...
+- def write_dxf_fast(
+-     points: np.ndarray,
+-     faces: np.ndarray,
+-     output_file: Optional[Union[str, "os.PathLike[str]"]] = None,
+--) -> str:
+-+) -> Optional[str]:
+-     """Write a triangle mesh as 3DFACE entities.
+- 
+-     Parameters
+-@@ -74,21 +78,27 @@ def write_dxf_fast(
+-     faces : numpy.ndarray
+-         (M, 3) vertex indices.
+-     output_file : str or path-like, optional
+--        If given, the DXF content is also written to this file.
+-+        If given, the DXF is streamed to this file and nothing is returned. This avoids
+-+        building the whole document in memory.
+- 
+-     Returns
+-     -------
+--    str
+--        The DXF content.
+-+    str or None
+-+        The DXF content if ``output_file`` is None, otherwise None.
+-+
+-+    Raises
+-+    ------
+-+    ValueError
+-+        If the arrays do not have shape (N, 3) or a face index is out of range.
+-     """
+--    content = _rs.write_dxf_fast(
+--        np.asarray(points, dtype=np.float64).tolist(),
+--        np.asarray(faces, dtype=np.intp).tolist(),
+--    )
+--    if output_file is not None:
+--        with open(os.fspath(output_file), "w", encoding="utf-8") as f:
+--            f.write(content)
+--    return content
+-+    pts = np.ascontiguousarray(points, dtype=np.float64)
+-+    fcs = np.ascontiguousarray(faces, dtype=np.int64)
+-+    if pts.ndim != 2 or fcs.ndim != 2:
+-+        raise ValueError("points and faces must be 2D arrays of shape (N, 3)")
+-+    if output_file is None:
+-+        return _rs.write_dxf_string(pts, fcs)
+-+    _rs.write_dxf_file(output_file, pts, fcs)
+-+    return None
+- 
+- 
+- class MeshWithAttributes:
+-@@ -127,9 +137,13 @@ class MeshWithAttributes:
+-         """Number of connected components."""
+-         return int(np.max(self.labels)) + 1 if len(self.labels) else 0
+- 
+--    def to_dxf(self, output_file: Optional[Union[str, "os.PathLike[str]"]] = None) -> str:
+--        """Export to DXF (3DFACE entities)."""
+--        return write_dxf_fast(self.points, self.faces, output_file)
+-+    @overload
+-+    def to_dxf(self, output_file: None = None) -> str: ...
+-+    @overload
+-+    def to_dxf(self, output_file: Union[str, "os.PathLike[str]"]) -> None: ...
+-+    def to_dxf(self, output_file: Optional[Union[str, "os.PathLike[str]"]] = None) -> Optional[str]:
+-+        """Export to DXF (3DFACE entities). See :func:`write_dxf_fast`."""
+-+        return write_dxf_fast(self.points, self.faces, output_file)  # type: ignore[call-overload]
+- 
+-     def to_pyvista(self) -> "pv.PolyData":
+-         """Convert to a :class:`pyvista.PolyData` (requires PyVista)."""
+-diff --git a/python/dxf_io/_dxf_io.pyi b/python/dxf_io/_dxf_io.pyi
+-index 002fd1a..9e6d9bf 100644
+---- a/python/dxf_io/_dxf_io.pyi
+-+++ b/python/dxf_io/_dxf_io.pyi
+-@@ -1,31 +1,17 @@
+- """Type stubs for the compiled Rust extension ``dxf_io._dxf_io``."""
+- 
+-+import os
+-+
+- import numpy as np
+- import numpy.typing as npt
+- 
+--class RawMesh:
+--    """Triangle mesh produced by the Rust parser."""
+--
+--    points: list[list[float]]
+--    faces: list[list[int]]
+--    labels: list[int]
+--
+--    def __init__(
+--        self,
+--        points: list[list[float]],
+--        faces: list[list[int]],
+--        labels: list[int],
+--    ) -> None: ...
+--    @property
+--    def n_points(self) -> int: ...
+--    @property
+--    def n_faces(self) -> int: ...
+--    @property
+--    def n_components(self) -> int: ...
+--    def points_array(self) -> npt.NDArray[np.float64]: ...
+--    def faces_array(self) -> npt.NDArray[np.uint64]: ...
+--    def labels_array(self) -> npt.NDArray[np.uint64]: ...
+--    def to_dxf(self) -> str: ...
+--
+--def parse_dxf_fast(dxf_content: str, decimals: int = 6) -> RawMesh: ...
+--def write_dxf_fast(points: list[list[float]], faces: list[list[int]]) -> str: ...
+-+def parse_dxf_bytes(
+-+    data: bytes, decimals: int = 6
+-+) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.int64], npt.NDArray[np.int64]]: ...
+-+def parse_dxf_file(
+-+    path: str | os.PathLike[str], decimals: int = 6
+-+) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.int64], npt.NDArray[np.int64]]: ...
+-+def write_dxf_string(points: npt.NDArray[np.float64], faces: npt.NDArray[np.int64]) -> str: ...
+-+def write_dxf_file(
+-+    path: str | os.PathLike[str], points: npt.NDArray[np.float64], faces: npt.NDArray[np.int64]
+-+) -> None: ...
+-diff --git a/src/lib.rs b/src/lib.rs
+-index 3f8aed8..c020aea 100644
+---- a/src/lib.rs
+-+++ b/src/lib.rs
+-@@ -1,18 +1,39 @@
+--use ndarray::{Array1, Array2};
+--use numpy::{IntoPyArray, PyArray1, PyArray2};
+-+//! Fast SOLID / 3DFACE reader and writer for ASCII DXF files.
+-+//!
+-+//! The Python-facing API lives at the bottom of this file; everything above is plain
+-+//! Rust so that it can be unit-tested without an interpreter.
+-+
+-+use std::fs::File;
+-+use std::io::{self, BufWriter, Write};
+-+use std::path::PathBuf;
+-+
+-+use ndarray::Array2;
+-+use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray2, PyUntypedArrayMethods};
+-+use pyo3::exceptions::PyValueError;
+- use pyo3::prelude::*;
+-+use rayon::prelude::*;
+- use rustc_hash::FxHashMap;
+- 
+- type Vertex = [f64; 3];
+- 
+--/// Entity currently being read from the DXF stream.
+-+// ---------------------------------------------------------------------------
+-+// Parsing
+-+// ---------------------------------------------------------------------------
+-+
+-+/// One SOLID / 3DFACE entity, with corners already in perimeter order.
+-+#[derive(Clone, Copy)]
+-+struct Quad {
+-+    corners: [Vertex; 4],
+-+    /// `true` when the entity is a triangle (4th corner missing or repeated).
+-+    triangle: bool,
+-+}
+-+
+- #[derive(Clone, Copy, PartialEq)]
+- enum Kind {
+-     Solid,
+-     Face3d,
+- }
+- 
+--/// Accumulates the (up to) four corners of a SOLID / 3DFACE entity.
+- struct Entity {
+-     kind: Kind,
+-     corners: [Vertex; 4],
+-@@ -28,98 +49,110 @@ impl Entity {
+-         }
+-     }
+- 
+--    /// Triangles (as corner indices) describing the entity.
+--    ///
+--    /// For SOLID the corners are stored in "zig-zag" order (0, 1, 3, 2 around the
+--    /// perimeter), whereas 3DFACE stores them in perimeter order.
+--    fn triangles(&self) -> Vec<[usize; 3]> {
+--        let perimeter: [usize; 4] = match self.kind {
+--            Kind::Solid => [0, 1, 3, 2],
+--            Kind::Face3d => [0, 1, 2, 3],
+--        };
+--        let c = &self.corners;
+-+    fn finish(mut self) -> Quad {
+-         // A missing or repeated 4th corner means the entity is a triangle.
+--        if !self.has_fourth || c[3] == c[2] {
+--            return vec![[0, 1, 2]];
+-+        let triangle = !self.has_fourth || self.corners[3] == self.corners[2];
+-+        // SOLID stores the corners of a quad in "zig-zag" order (0, 1, 3, 2 around the
+-+        // perimeter), whereas 3DFACE stores them in perimeter order.
+-+        if self.kind == Kind::Solid && !triangle {
+-+            self.corners.swap(2, 3);
+-+        }
+-+        Quad {
+-+            corners: self.corners,
+-+            triangle,
+-         }
+--        let [a, b, cc, d] = perimeter;
+--        vec![[a, b, cc], [a, cc, d]]
+-     }
+- }
+- 
+--struct Builder {
+--    points: Vec<Vertex>,
+--    faces: Vec<[usize; 3]>,
+--    index: FxHashMap<[i64; 3], usize>,
+--    scale: f64,
+-+/// Iterator over `(group code, value)` line pairs of an ASCII DXF buffer.
+-+struct Pairs<'a> {
+-+    data: &'a [u8],
+-+    pos: usize,
+- }
+- 
+--impl Builder {
+--    fn new(decimals: i32) -> Self {
+--        Builder {
+--            points: Vec::new(),
+--            faces: Vec::new(),
+--            index: FxHashMap::default(),
+--            scale: 10f64.powi(decimals),
+-+#[inline]
+-+fn trim(mut s: &[u8]) -> &[u8] {
+-+    while let [first, rest @ ..] = s {
+-+        if first.is_ascii_whitespace() {
+-+            s = rest;
+-+        } else {
+-+            break;
+-+        }
+-+    }
+-+    while let [rest @ .., last] = s {
+-+        if last.is_ascii_whitespace() {
+-+            s = rest;
+-+        } else {
+-+            break;
+-         }
+-     }
+-+    s
+-+}
+- 
+--    fn vertex_id(&mut self, v: Vertex) -> usize {
+--        let key = [
+--            (v[0] * self.scale).round() as i64,
+--            (v[1] * self.scale).round() as i64,
+--            (v[2] * self.scale).round() as i64,
+--        ];
+--        if let Some(&idx) = self.index.get(&key) {
+--            return idx;
+-+impl<'a> Pairs<'a> {
+-+    #[inline]
+-+    fn line(&mut self) -> Option<&'a [u8]> {
+-+        if self.pos >= self.data.len() {
+-+            return None;
+-         }
+--        let idx = self.points.len();
+--        self.points.push(v);
+--        self.index.insert(key, idx);
+--        idx
+-+        let rest = &self.data[self.pos..];
+-+        let (line, advance) = match memchr::memchr(b'\n', rest) {
+-+            Some(i) => (&rest[..i], i + 1),
+-+            None => (rest, rest.len()),
+-+        };
+-+        self.pos += advance;
+-+        Some(trim(line))
+-     }
+-+}
+- 
+--    fn push_entity(&mut self, entity: &Entity) {
+--        for tri in entity.triangles() {
+--            let ids = [
+--                self.vertex_id(entity.corners[tri[0]]),
+--                self.vertex_id(entity.corners[tri[1]]),
+--                self.vertex_id(entity.corners[tri[2]]),
+--            ];
+--            // Skip degenerate triangles (repeated vertices).
+--            if ids[0] != ids[1] && ids[1] != ids[2] && ids[0] != ids[2] {
+--                self.faces.push(ids);
+--            }
+-+impl<'a> Iterator for Pairs<'a> {
+-+    type Item = (&'a [u8], &'a [u8]);
+-+
+-+    #[inline]
+-+    fn next(&mut self) -> Option<Self::Item> {
+-+        let code = self.line()?;
+-+        let value = self.line()?;
+-+        Some((code, value))
+-+    }
+-+}
+-+
+-+#[inline]
+-+fn parse_code(code: &[u8]) -> Option<u32> {
+-+    if code.is_empty() || code.len() > 5 {
+-+        return None;
+-+    }
+-+    let mut n = 0u32;
+-+    for &b in code {
+-+        if !b.is_ascii_digit() {
+-+            return None;
+-         }
+-+        n = n * 10 + u32::from(b - b'0');
+-     }
+-+    Some(n)
+- }
+- 
+--/// Parse SOLID and 3DFACE entities from ASCII DXF content.
+--///
+--/// Vertices are merged when they are equal after rounding to `decimals` places.
+--fn parse_dxf(content: &str, decimals: i32) -> (Vec<Vertex>, Vec<[usize; 3]>) {
+--    let mut builder = Builder::new(decimals);
+-+/// Parse every SOLID / 3DFACE entity of `data`, which must start on a group code line
+-+/// and must not start in the middle of an entity.
+-+fn parse_chunk(data: &[u8]) -> Vec<Quad> {
+-+    // A quad takes roughly 150-250 bytes of text.
+-+    let mut quads = Vec::with_capacity(data.len() / 200);
+-     let mut current: Option<Entity> = None;
+--    let mut lines = content.lines();
+- 
+--    while let (Some(code_line), Some(value_line)) = (lines.next(), lines.next()) {
+--        let Ok(code) = code_line.trim().parse::<i32>() else {
+-+    for (code, value) in (Pairs { data, pos: 0 }) {
+-+        let Some(code) = parse_code(code) else {
+-             continue;
+-         };
+--        let value = value_line.trim();
+--
+-         if code == 0 {
+-             if let Some(entity) = current.take() {
+--                builder.push_entity(&entity);
+-+                quads.push(entity.finish());
+-             }
+-             current = match value {
+--                "SOLID" => Some(Entity::new(Kind::Solid)),
+--                "3DFACE" => Some(Entity::new(Kind::Face3d)),
+-+                b"SOLID" => Some(Entity::new(Kind::Solid)),
+-+                b"3DFACE" => Some(Entity::new(Kind::Face3d)),
+-                 _ => None,
+-             };
+-             continue;
+-         }
+--
+-         let Some(entity) = current.as_mut() else {
+-             continue;
+-         };
+-@@ -130,7 +163,7 @@ fn parse_dxf(content: &str, decimals: i32) -> (Vec<Vertex>, Vec<[usize; 3]>) {
+-             30..=33 => (2, (code - 30) as usize),
+-             _ => continue,
+-         };
+--        if let Ok(val) = value.parse::<f64>() {
+-+        if let Ok(val) = fast_float2::parse::<f64, _>(value) {
+-             entity.corners[corner][axis] = val;
+-             if corner == 3 {
+-                 entity.has_fourth = true;
+-@@ -138,199 +171,384 @@ fn parse_dxf(content: &str, decimals: i32) -> (Vec<Vertex>, Vec<[usize; 3]>) {
+-         }
+-     }
+-     if let Some(entity) = current.take() {
+--        builder.push_entity(&entity);
+-+        quads.push(entity.finish());
+-     }
+-+    quads
+-+}
+- 
+--    (builder.points, builder.faces)
+-+/// Split `data` in at most `n` chunks that each start on an entity boundary
+-+/// (a `0` group code line), so that they can be parsed independently.
+-+fn chunk_bounds(data: &[u8], n: usize) -> Vec<usize> {
+-+    let mut bounds = vec![0];
+-+    if n <= 1 {
+-+        bounds.push(data.len());
+-+        return bounds;
+-+    }
+-+    let mut lines_before = 0usize; // number of '\n' in data[..scanned]
+-+    let mut scanned = 0usize;
+-+    for k in 1..n {
+-+        let target = data.len() / n * k;
+-+        if target <= *bounds.last().unwrap() {
+-+            continue;
+-+        }
+-+        // Count lines up to `target`, then move to the start of the next line.
+-+        lines_before += memchr::memchr_iter(b'\n', &data[scanned..target]).count();
+-+        let Some(i) = memchr::memchr(b'\n', &data[target..]) else {
+-+            break;
+-+        };
+-+        let mut pos = target + i + 1;
+-+        lines_before += 1;
+-+        scanned = pos;
+-+        // Group codes are on even lines: skip a value line if needed.
+-+        if lines_before % 2 == 1 {
+-+            let Some(i) = memchr::memchr(b'\n', &data[pos..]) else {
+-+                break;
+-+            };
+-+            pos += i + 1;
+-+            lines_before += 1;
+-+            scanned = pos;
+-+        }
+-+        // Advance pair by pair to the next entity (group code 0).
+-+        let mut pairs = Pairs { data, pos };
+-+        loop {
+-+            let start = pairs.pos;
+-+            match pairs.next() {
+-+                Some((code, _)) if parse_code(code) == Some(0) => {
+-+                    pos = start;
+-+                    break;
+-+                }
+-+                Some(_) => {}
+-+                None => {
+-+                    pos = data.len();
+-+                    break;
+-+                }
+-+            }
+-+        }
+-+        if pos >= data.len() {
+-+            break;
+-+        }
+-+        // Keep the line counter in sync with the new scan position.
+-+        lines_before += memchr::memchr_iter(b'\n', &data[scanned..pos]).count();
+-+        scanned = pos;
+-+        if pos > *bounds.last().unwrap() {
+-+            bounds.push(pos);
+-+        }
+-+    }
+-+    bounds.push(data.len());
+-+    bounds
+- }
+- 
+--struct UnionFind {
+--    parent: Vec<usize>,
+--    rank: Vec<u32>,
+-+/// Mesh produced by the parser, stored as flat row-major buffers.
+-+struct Mesh {
+-+    points: Vec<f64>,
+-+    faces: Vec<i64>,
+-+    labels: Vec<i64>,
+- }
+- 
+--impl UnionFind {
+--    fn new(n: usize) -> Self {
+--        UnionFind {
+--            parent: (0..n).collect(),
+--            rank: vec![0; n],
+-+/// Merge the corners of all quads (vertices equal after rounding to `decimals`
+-+/// places are shared) and triangulate them.
+-+fn build_mesh(parts: &[Vec<Quad>], decimals: i32) -> Mesh {
+-+    let scale = 10f64.powi(decimals);
+-+    let n_quads: usize = parts.iter().map(Vec::len).sum();
+-+    let mut index: FxHashMap<[i64; 3], i64> =
+-+        FxHashMap::with_capacity_and_hasher(n_quads + n_quads / 4, Default::default());
+-+    let mut points: Vec<f64> = Vec::with_capacity(n_quads * 3);
+-+    let mut faces: Vec<i64> = Vec::with_capacity(n_quads * 6);
+-+
+-+    for quad in parts.iter().flatten() {
+-+        let n_corners = if quad.triangle { 3 } else { 4 };
+-+        let mut ids = [0i64; 4];
+-+        for (id, v) in ids.iter_mut().zip(&quad.corners).take(n_corners) {
+-+            let key = [
+-+                (v[0] * scale).round() as i64,
+-+                (v[1] * scale).round() as i64,
+-+                (v[2] * scale).round() as i64,
+-+            ];
+-+            let next = (points.len() / 3) as i64;
+-+            *id = *index.entry(key).or_insert_with(|| {
+-+                points.extend_from_slice(v);
+-+                next
+-+            });
+-         }
+--    }
+--
+--    fn find(&mut self, x: usize) -> usize {
+--        if self.parent[x] != x {
+--            self.parent[x] = self.find(self.parent[x]);
+-+        let mut push = |a: i64, b: i64, c: i64| {
+-+            // Skip degenerate triangles (repeated vertices).
+-+            if a != b && b != c && a != c {
+-+                faces.extend_from_slice(&[a, b, c]);
+-+            }
+-+        };
+-+        push(ids[0], ids[1], ids[2]);
+-+        if !quad.triangle {
+-+            push(ids[0], ids[2], ids[3]);
+-         }
+--        self.parent[x]
+-     }
+- 
+--    fn union(&mut self, x: usize, y: usize) {
+--        let px = self.find(x);
+--        let py = self.find(y);
+--        if px != py {
+--            if self.rank[px] < self.rank[py] {
+--                self.parent[px] = py;
+--            } else if self.rank[px] > self.rank[py] {
+--                self.parent[py] = px;
+--            } else {
+--                self.parent[py] = px;
+--                self.rank[px] += 1;
+--            }
+--        }
+-+    let n_points = points.len() / 3;
+-+    let labels = connected_components(n_points, &faces);
+-+    Mesh {
+-+        points,
+-+        faces,
+-+        labels,
+-     }
+- }
+- 
+--fn extract_components(n_points: usize, faces: &[[usize; 3]]) -> Vec<usize> {
+--    if n_points == 0 {
+--        return Vec::new();
+-+fn find(parent: &mut [u32], mut x: usize) -> usize {
+-+    let mut root = x;
+-+    while parent[root] as usize != root {
+-+        root = parent[root] as usize;
+-     }
+--    let max_vertex = n_points - 1;
+--    let mut uf = UnionFind::new(n_points);
+--
+--    for &face in faces {
+--        uf.union(face[0], face[1]);
+--        uf.union(face[1], face[2]);
+-+    // Path compression.
+-+    while parent[x] as usize != root {
+-+        let next = parent[x] as usize;
+-+        parent[x] = root as u32;
+-+        x = next;
+-     }
+-+    root
+-+}
+- 
+--    let mut labels = vec![0; max_vertex + 1];
+--    let mut component_id = 0;
+--    let mut next_id = FxHashMap::default();
+--
+--    for i in 0..=max_vertex {
+--        let root = uf.find(i);
+--        if !next_id.contains_key(&root) {
+--            next_id.insert(root, component_id);
+--            component_id += 1;
+-+/// Connected-component id of every point (ids are numbered by first appearance).
+-+fn connected_components(n_points: usize, faces: &[i64]) -> Vec<i64> {
+-+    let mut parent: Vec<u32> = (0..n_points as u32).collect();
+-+    for tri in faces.chunks_exact(3) {
+-+        let a = find(&mut parent, tri[0] as usize);
+-+        for &other in &tri[1..] {
+-+            let b = find(&mut parent, other as usize);
+-+            let a = find(&mut parent, a);
+-+            if a != b {
+-+                parent[b] = a as u32;
+-+            }
+-         }
+--        labels[i] = next_id[&root];
+-     }
+--
+-+    let mut ids = vec![-1i64; n_points];
+-+    let mut labels = Vec::with_capacity(n_points);
+-+    let mut next = 0i64;
+-+    for i in 0..n_points {
+-+        let root = find(&mut parent, i);
+-+        if ids[root] < 0 {
+-+            ids[root] = next;
+-+            next += 1;
+-+        }
+-+        labels.push(ids[root]);
+-+    }
+-     labels
+- }
+- 
+--fn write_dxf_face(vertices: &[Vertex; 3], face_id: usize) -> String {
+--    let mut dxf_data = String::new();
+--    dxf_data.push_str("  0\n3DFACE\n");
+--    dxf_data.push_str("  8\n0\n");
+--    dxf_data.push_str(&format!(" 62\n{}\n", face_id % 255 + 1));
+--
+--    // A 3DFACE always has four corners; a triangle repeats the third one.
+--    for i in 0..4 {
+--        let v = vertices[i.min(2)];
+--        dxf_data.push_str(&format!(" {}\n{:.6}\n", 10 + i, v[0]));
+--        dxf_data.push_str(&format!(" {}\n{:.6}\n", 20 + i, v[1]));
+--        dxf_data.push_str(&format!(" {}\n{:.6}\n", 30 + i, v[2]));
+--    }
+--
+--    dxf_data
+-+fn parse_dxf(data: &[u8], decimals: i32) -> Mesh {
+-+    // Chunks are only worth it for large inputs.
+-+    let n_chunks = if data.len() > (4 << 20) {
+-+        rayon::current_num_threads().max(1) * 4
+-+    } else {
+-+        1
+-+    };
+-+    let bounds = chunk_bounds(data, n_chunks);
+-+    let parts: Vec<Vec<Quad>> = bounds
+-+        .windows(2)
+-+        .collect::<Vec<_>>()
+-+        .into_par_iter()
+-+        .map(|w| parse_chunk(&data[w[0]..w[1]]))
+-+        .collect();
+-+    build_mesh(&parts, decimals)
+- }
+- 
+--fn write_dxf(points: &[[f64; 3]], faces: &[[usize; 3]]) -> String {
+--    let mut dxf_content = String::new();
+--
+--    dxf_content.push_str("  0\nSECTION\n  2\nHEADER\n  9\n$ACADVER\n  1\nAC1018\n  0\nENDSEC\n");
+--    dxf_content.push_str("  0\nSECTION\n  2\nTABLES\n  0\nTABLE\n  2\nLAYER\n 70\n1\n");
+--    dxf_content.push_str("  0\nLAYER\n  2\n0\n 70\n0\n 62\n7\n  6\nCONTINUOUS\n  0\nENDTAB\n");
+--    dxf_content.push_str("  0\nENDSEC\n  0\nSECTION\n  2\nENTITIES\n");
+--
+--    for (face_idx, face) in faces.iter().enumerate() {
+--        let vertices = [
+--            points[face[0]],
+--            points[face[1]],
+--            points[face[2]],
+--        ];
+--        dxf_content.push_str(&write_dxf_face(&vertices, face_idx));
+-+// ---------------------------------------------------------------------------
+-+// Writing
+-+// ---------------------------------------------------------------------------
+-+
+-+const DXF_HEADER: &str = "  0\nSECTION\n  2\nHEADER\n  9\n$ACADVER\n  1\nAC1018\n  0\nENDSEC\n\
+-+  0\nSECTION\n  2\nTABLES\n  0\nTABLE\n  2\nLAYER\n 70\n1\n\
+-+  0\nLAYER\n  2\n0\n 70\n0\n 62\n7\n  6\nCONTINUOUS\n  0\nENDTAB\n\
+-+  0\nENDSEC\n  0\nSECTION\n  2\nENTITIES\n";
+-+const DXF_FOOTER: &str = "  0\nENDSEC\n  0\nEOF\n";
+-+
+-+/// Append `v` with six decimals (like `format!("{:.6}", v)`, but much faster).
+-+fn push_fixed6(buf: &mut Vec<u8>, v: f64) {
+-+    if !v.is_finite() || v.abs() >= 1e12 {
+-+        let _ = write!(buf, "{v:.6}");
+-+        return;
+-     }
+--
+--    dxf_content.push_str("  0\nENDSEC\n  0\nEOF\n");
+--    dxf_content
+--}
+--
+--#[pyclass]
+--struct RawMesh {
+--    #[pyo3(get)]
+--    points: Vec<[f64; 3]>,
+--    #[pyo3(get)]
+--    faces: Vec<[usize; 3]>,
+--    #[pyo3(get)]
+--    labels: Vec<usize>,
+-+    let scaled = (v.abs() * 1e6).round() as u64;
+-+    if v.is_sign_negative() && scaled != 0 {
+-+        buf.push(b'-');
+-+    }
+-+    push_u64(buf, scaled / 1_000_000);
+-+    buf.push(b'.');
+-+    let frac = (scaled % 1_000_000) as u32;
+-+    let mut digits = [b'0'; 6];
+-+    let mut f = frac;
+-+    for d in digits.iter_mut().rev() {
+-+        *d = b'0' + (f % 10) as u8;
+-+        f /= 10;
+-+    }
+-+    buf.extend_from_slice(&digits);
+- }
+- 
+--#[pymethods]
+--impl RawMesh {
+--    #[new]
+--    fn new(points: Vec<[f64; 3]>, faces: Vec<[usize; 3]>, labels: Vec<usize>) -> Self {
+--        RawMesh {
+--            points,
+--            faces,
+--            labels,
+-+fn push_u64(buf: &mut Vec<u8>, mut n: u64) {
+-+    let mut tmp = [0u8; 20];
+-+    let mut i = tmp.len();
+-+    loop {
+-+        i -= 1;
+-+        tmp[i] = b'0' + (n % 10) as u8;
+-+        n /= 10;
+-+        if n == 0 {
+-+            break;
+-         }
+-     }
+-+    buf.extend_from_slice(&tmp[i..]);
+-+}
+- 
+--    #[getter]
+--    fn n_points(&self) -> usize {
+--        self.points.len()
+-+/// Render the 3DFACE entities of faces `first..first + faces.len() / 3`.
+-+fn render_faces(points: &[f64], faces: &[i64], first: usize) -> Vec<u8> {
+-+    let mut buf = Vec::with_capacity(faces.len() / 3 * 330);
+-+    for (k, tri) in faces.chunks_exact(3).enumerate() {
+-+        buf.extend_from_slice(b"  0\n3DFACE\n  8\n0\n 62\n");
+-+        push_u64(&mut buf, ((first + k) % 255 + 1) as u64);
+-+        buf.push(b'\n');
+-+        // A 3DFACE always has four corners; a triangle repeats the third one.
+-+        for corner in 0..4usize {
+-+            let p = tri[corner.min(2)] as usize * 3;
+-+            for (axis, base) in [10u64, 20, 30].into_iter().enumerate() {
+-+                buf.push(b' ');
+-+                push_u64(&mut buf, base + corner as u64);
+-+                buf.push(b'\n');
+-+                push_fixed6(&mut buf, points[p + axis]);
+-+                buf.push(b'\n');
+-+            }
+-+        }
+-     }
+-+    buf
+-+}
+- 
+--    #[getter]
+--    fn n_faces(&self) -> usize {
+--        self.faces.len()
+-+fn check_faces(n_points: usize, faces: &[i64]) -> Result<(), String> {
+-+    match faces.iter().find(|&&i| i < 0 || i as usize >= n_points) {
+-+        Some(i) => Err(format!(
+-+            "face index {i} is out of range for a mesh with {n_points} points"
+-+        )),
+-+        None => Ok(()),
+-     }
+-+}
+- 
+--    #[getter]
+--    fn n_components(&self) -> usize {
+--        self.labels.iter().max().map_or(0, |m| m + 1)
+-+/// Write a complete DXF document to `sink`, formatting faces in parallel.
+-+fn write_dxf<W: Write>(sink: &mut W, points: &[f64], faces: &[i64]) -> io::Result<()> {
+-+    const BLOCK: usize = 16_384; // faces per parallel work item
+-+    sink.write_all(DXF_HEADER.as_bytes())?;
+-+    let batch = BLOCK * 3 * rayon::current_num_threads().max(1) * 4;
+-+    let mut first = 0usize;
+-+    for group in faces.chunks(batch) {
+-+        let rendered: Vec<Vec<u8>> = group
+-+            .par_chunks(BLOCK * 3)
+-+            .enumerate()
+-+            .map(|(i, chunk)| render_faces(points, chunk, first + i * BLOCK))
+-+            .collect();
+-+        for part in &rendered {
+-+            sink.write_all(part)?;
+-+        }
+-+        first += group.len() / 3;
+-     }
+-+    sink.write_all(DXF_FOOTER.as_bytes())
+-+}
+- 
+--    fn points_array<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<f64>> {
+--        let points_2d = Array2::from_shape_vec(
+--            (self.points.len(), 3),
+--            self.points.iter().flat_map(|p| vec![p[0], p[1], p[2]]).collect(),
+--        )
+--        .unwrap();
+--        points_2d.into_pyarray(py)
+--    }
+-+// ---------------------------------------------------------------------------
+-+// Python API
+-+// ---------------------------------------------------------------------------
+-+
+-+type MeshArrays<'py> = (
+-+    Bound<'py, PyArray2<f64>>,
+-+    Bound<'py, PyArray2<i64>>,
+-+    Bound<'py, PyArray1<i64>>,
+-+);
+-+
+-+fn into_arrays<'py>(py: Python<'py>, mesh: Mesh) -> PyResult<MeshArrays<'py>> {
+-+    let n_points = mesh.points.len() / 3;
+-+    let n_faces = mesh.faces.len() / 3;
+-+    let points = Array2::from_shape_vec((n_points, 3), mesh.points)
+-+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+-+    let faces = Array2::from_shape_vec((n_faces, 3), mesh.faces)
+-+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+-+    Ok((
+-+        points.into_pyarray(py),
+-+        faces.into_pyarray(py),
+-+        PyArray1::from_vec(py, mesh.labels),
+-+    ))
+-+}
+- 
+--    fn faces_array<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<usize>> {
+--        let faces_2d = Array2::from_shape_vec(
+--            (self.faces.len(), 3),
+--            self.faces.iter().flat_map(|f| vec![f[0], f[1], f[2]]).collect(),
+--        )
+--        .unwrap();
+--        faces_2d.into_pyarray(py)
+--    }
+-+/// Parse DXF content given as bytes.
+-+///
+-+/// Returns ``(points, faces, labels)``: float64 ``(N, 3)`` coordinates, int64
+-+/// ``(M, 3)`` triangle indices and the int64 connected-component id of each point.
+-+#[pyfunction]
+-+#[pyo3(signature = (data, decimals = 6))]
+-+fn parse_dxf_bytes<'py>(py: Python<'py>, data: &[u8], decimals: i32) -> PyResult<MeshArrays<'py>> {
+-+    let mesh = py.detach(|| parse_dxf(data, decimals));
+-+    into_arrays(py, mesh)
+-+}
+- 
+--    fn labels_array<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<usize>> {
+--        Array1::from_vec(self.labels.clone()).into_pyarray(py)
+--    }
+-+/// Parse a DXF file (read directly by Rust, without going through a Python string).
+-+#[pyfunction]
+-+#[pyo3(signature = (path, decimals = 6))]
+-+fn parse_dxf_file<'py>(py: Python<'py>, path: PathBuf, decimals: i32) -> PyResult<MeshArrays<'py>> {
+-+    let mesh = py.detach(|| -> io::Result<Mesh> {
+-+        let data = std::fs::read(&path)?;
+-+        Ok(parse_dxf(&data, decimals))
+-+    })?;
+-+    into_arrays(py, mesh)
+-+}
+- 
+--    fn to_dxf(&self) -> String {
+--        write_dxf(&self.points, &self.faces)
+-+fn views<'a>(
+-+    points: &'a PyReadonlyArray2<'_, f64>,
+-+    faces: &'a PyReadonlyArray2<'_, i64>,
+-+) -> PyResult<(&'a [f64], &'a [i64])> {
+-+    if points.shape()[1] != 3 || faces.shape()[1] != 3 {
+-+        return Err(PyValueError::new_err(
+-+            "points and faces must have shape (N, 3)",
+-+        ));
+-     }
+-+    let pts = points
+-+        .as_slice()
+-+        .map_err(|_| PyValueError::new_err("points must be C-contiguous"))?;
+-+    let fcs = faces
+-+        .as_slice()
+-+        .map_err(|_| PyValueError::new_err("faces must be C-contiguous"))?;
+-+    check_faces(pts.len() / 3, fcs).map_err(PyValueError::new_err)?;
+-+    Ok((pts, fcs))
+- }
+- 
+-+/// Render a triangle mesh as a DXF document made of 3DFACE entities.
+- #[pyfunction]
+--#[pyo3(signature = (dxf_content, decimals = 6))]
+--fn parse_dxf_fast(dxf_content: &str, decimals: i32) -> PyResult<RawMesh> {
+--    let (points, faces) = parse_dxf(dxf_content, decimals);
+--    let labels = extract_components(points.len(), &faces);
+--
+--    Ok(RawMesh {
+--        points,
+--        faces,
+--        labels,
+--    })
+-+fn write_dxf_string(
+-+    py: Python<'_>,
+-+    points: PyReadonlyArray2<'_, f64>,
+-+    faces: PyReadonlyArray2<'_, i64>,
+-+) -> PyResult<String> {
+-+    let (pts, fcs) = views(&points, &faces)?;
+-+    let bytes = py.detach(|| -> io::Result<Vec<u8>> {
+-+        let mut out = Vec::with_capacity(fcs.len() / 3 * 330 + 512);
+-+        write_dxf(&mut out, pts, fcs)?;
+-+        Ok(out)
+-+    })?;
+-+    String::from_utf8(bytes).map_err(|e| PyValueError::new_err(e.to_string()))
+- }
+- 
+-+/// Write a triangle mesh to ``path`` as a DXF document made of 3DFACE entities.
+- #[pyfunction]
+--fn write_dxf_fast(points: Vec<[f64; 3]>, faces: Vec<[usize; 3]>) -> PyResult<String> {
+--    Ok(write_dxf(&points, &faces))
+-+fn write_dxf_file(
+-+    py: Python<'_>,
+-+    path: PathBuf,
+-+    points: PyReadonlyArray2<'_, f64>,
+-+    faces: PyReadonlyArray2<'_, i64>,
+-+) -> PyResult<()> {
+-+    let (pts, fcs) = views(&points, &faces)?;
+-+    py.detach(|| -> io::Result<()> {
+-+        let mut out = BufWriter::with_capacity(1 << 20, File::create(&path)?);
+-+        write_dxf(&mut out, pts, fcs)?;
+-+        out.flush()
+-+    })?;
+-+    Ok(())
+- }
+- 
+- #[pymodule]
+- fn _dxf_io(m: &Bound<'_, PyModule>) -> PyResult<()> {
+--    m.add_function(wrap_pyfunction!(parse_dxf_fast, m)?)?;
+--    m.add_function(wrap_pyfunction!(write_dxf_fast, m)?)?;
+--    m.add_class::<RawMesh>()?;
+-+    m.add_function(wrap_pyfunction!(parse_dxf_bytes, m)?)?;
+-+    m.add_function(wrap_pyfunction!(parse_dxf_file, m)?)?;
+-+    m.add_function(wrap_pyfunction!(write_dxf_string, m)?)?;
+-+    m.add_function(wrap_pyfunction!(write_dxf_file, m)?)?;
+-     Ok(())
+- }
+-diff --git a/tests/test_basic.py b/tests/test_basic.py
+-index 50bc2c1..5a317e2 100644
+---- a/tests/test_basic.py
+-+++ b/tests/test_basic.py
+-@@ -2,6 +2,7 @@
+- 
+- from __future__ import annotations
+- 
+-+from collections.abc import Sequence
+- from pathlib import Path
+- 
+- import numpy as np
+-@@ -16,7 +17,7 @@ from dxf_io import (
+- )
+- 
+- 
+--def _entity(name: str, corners: list[tuple[float, float, float]]) -> str:
+-+def _entity(name: str, corners: Sequence[Sequence[float]]) -> str:
+-     out = f"  0\n{name}\n  8\n0\n"
+-     for i, (x, y, z) in enumerate(corners):
+-         out += f" {10 + i}\n{x}\n {20 + i}\n{y}\n {30 + i}\n{z}\n"
+-@@ -94,6 +95,129 @@ class TestParsing:
+-             parse_dxf_fast(tmp_path / "missing.dxf")
+- 
+- 
+-+def _grid_dxf(n: int, parts: int = 1, eol: str = "\n", kind: str = "3DFACE") -> str:
+-+    """``parts`` disjoint n x n grids of quads."""
+-+    chunks = []
+-+    for part in range(parts):
+-+        off = part * (n + 5)
+-+        for i in range(n):
+-+            for j in range(n):
+-+                x, y = off + i, j
+-+                corners = [(x, y, 0), (x + 1, y, 0), (x + 1, y + 1, 0), (x, y + 1, 0)]
+-+                if kind == "SOLID":  # zig-zag order
+-+                    corners[2], corners[3] = corners[3], corners[2]
+-+                chunks.append(_entity(kind, corners))
+-+    return _dxf(*chunks).replace("\n", eol)
+-+
+-+
+-+class TestLargeInputs:
+-+    """Inputs above 4 MB are split in chunks and parsed in parallel."""
+-+
+-+    @pytest.mark.parametrize("eol", ["\n", "\r\n"])
+-+    @pytest.mark.parametrize("kind", ["3DFACE", "SOLID"])
+-+    def test_parallel_matches_expected(self, eol: str, kind: str) -> None:
+-+        n, parts = 150, 3
+-+        text = _grid_dxf(n, parts, eol, kind)
+-+        assert len(text) > 4 << 20  # large enough to be chunked
+-+        mesh = parse_dxf_fast(text)
+-+        assert mesh["points"].shape == (parts * (n + 1) ** 2, 3)
+-+        assert mesh["faces"].shape == (parts * 2 * n * n, 3)
+-+        assert sorted(set(mesh["labels"].tolist())) == list(range(parts))
+-+        pts = mesh["points"]
+-+        area = sum(
+-+            0.5 * abs(np.cross(pts[b] - pts[a], pts[c] - pts[a])[2])
+-+            for a, b, c in mesh["faces"][:: len(mesh["faces"]) // 500]
+-+        )
+-+        assert area == pytest.approx(0.5 * len(mesh["faces"][:: len(mesh["faces"]) // 500]))
+-+
+-+    def test_chunked_equals_single_chunk(self, tmp_path: Path) -> None:
+-+        big = _grid_dxf(150, 3)
+-+        small = _grid_dxf(5, 3)
+-+        # The same parser must give identical results however the input is cut:
+-+        # compare the big input to itself through the file path and the bytes path.
+-+        path = tmp_path / "big.dxf"
+-+        path.write_text(big, encoding="utf-8")
+-+        a, b = parse_dxf_fast(big), parse_dxf_fast(path)
+-+        for key in ("points", "faces", "labels"):
+-+            np.testing.assert_array_equal(a[key], b[key])
+-+        assert parse_dxf_fast(small)["faces"].shape == (3 * 2 * 25, 3)
+-+
+-+
+-+class TestEdgeCases:
+-+    def test_solid_with_three_corners(self) -> None:
+-+        text = _dxf(_entity("SOLID", [(0, 0, 0), (1, 0, 0), (0, 1, 0)]))
+-+        mesh = parse_dxf_fast(text)
+-+        assert mesh["points"].shape == (3, 3)
+-+        assert mesh["faces"].shape == (1, 3)
+-+        assert sorted(map(tuple, mesh["points"].tolist())) == [
+-+            (0.0, 0.0, 0.0),
+-+            (0.0, 1.0, 0.0),
+-+            (1.0, 0.0, 0.0),
+-+        ]
+-+
+-+    def test_degenerate_entities_are_dropped(self) -> None:
+-+        text = _dxf(_entity("3DFACE", [(0, 0, 0), (0, 0, 0), (1, 0, 0), (1, 0, 0)]))
+-+        assert parse_dxf_fast(text)["faces"].shape == (0, 3)
+-+
+-+    def test_no_trailing_newline(self) -> None:
+-+        assert parse_dxf_fast(_dxf(SQUARE).rstrip("\n") + "\n  0\nEOF")["faces"].shape == (2, 3)
+-+
+-+    def test_parse_is_independent_of_decimals_type_hint(self) -> None:
+-+        assert parse_dxf_fast(_dxf(SQUARE), 0)["points"].shape == (4, 3)
+-+
+-+
+-+class TestWriteFormat:
+-+    def test_numbers_and_codes(self) -> None:
+-+        pts = np.array([[-0.5, 1234.5678915, 0.0], [1e-9, -1e-9, 2.0], [3.0, 4.0, 5.0]])
+-+        text = write_dxf_fast(pts, np.array([[0, 1, 2]]))
+-+        lines = text.splitlines()
+-+        body = lines[lines.index("ENTITIES") + 1 :]
+-+        assert body[:6] == ["  0", "3DFACE", "  8", "0", " 62", "1"]
+-+        pairs = {k.strip(): v for k, v in zip(body[6:30:2], body[7:30:2])}
+-+        # Each of the 12 group codes (10-13, 20-23, 30-33) appears exactly once.
+-+        assert sorted(pairs, key=int) == [
+-+            str(c) for c in (10, 11, 12, 13, 20, 21, 22, 23, 30, 31, 32, 33)
+-+        ]
+-+        assert pairs["10"] == "-0.500000"
+-+        assert pairs["20"] in ("1234.567891", "1234.567892")
+-+        assert pairs["11"] == "0.000000" and pairs["21"] == "0.000000"  # no "-0.000000"
+-+        assert pairs["13"] == pairs["12"] and pairs["33"] == pairs["32"]  # triangle
+-+
+-+    def test_huge_values_fall_back(self) -> None:
+-+        text = write_dxf_fast(np.array([[1e15, 0, 0], [0, 1, 0], [0, 0, 1]]), np.array([[0, 1, 2]]))
+-+        assert "1000000000000000.000000" in text
+-+
+-+    def test_file_equals_string(self, tmp_path: Path) -> None:
+-+        data = parse_dxf_fast(_grid_dxf(40, 2))
+-+        out = tmp_path / "f.dxf"
+-+        write_dxf_fast(data["points"], data["faces"], out)
+-+        assert out.read_text(encoding="utf-8") == write_dxf_fast(data["points"], data["faces"])
+-+
+-+    def test_large_roundtrip_is_lossless(self, tmp_path: Path) -> None:
+-+        # Enough faces for several parallel render blocks.
+-+        data = parse_dxf_fast(_grid_dxf(130, 1))
+-+        assert len(data["faces"]) > 16_384
+-+        out = tmp_path / "big.dxf"
+-+        write_dxf_fast(data["points"], data["faces"], out)
+-+        again = parse_dxf_fast(out)
+-+        assert again["faces"].shape == data["faces"].shape
+-+        np.testing.assert_allclose(again["points"], data["points"])
+-+
+-+    def test_non_contiguous_and_other_dtypes(self) -> None:
+-+        pts = np.arange(18.0).reshape(3, 6)[:, ::2]  # non-contiguous view
+-+        faces = np.array([[0, 1, 2]], dtype=np.int32)
+-+        assert write_dxf_fast(pts, faces).count("3DFACE") == 1
+-+
+-+    @pytest.mark.parametrize("faces", [[[0, 1, 3]], [[-1, 0, 1]]])
+-+    def test_bad_index(self, faces: list[list[int]]) -> None:
+-+        with pytest.raises(ValueError, match="out of range"):
+-+            write_dxf_fast(np.zeros((3, 3)), np.array(faces))
+-+
+-+    def test_bad_shape(self) -> None:
+-+        with pytest.raises(ValueError):
+-+            write_dxf_fast(np.zeros((3, 2)), np.array([[0, 1, 2]]))
+-+
+-+
+- class TestComponents:
+-     def test_split(self) -> None:
+-         meshes = dxf_to_manifold_meshes(TWO_PARTS, use_pyvista=False)
+-@@ -138,8 +262,8 @@ class TestWriting:
+-         data = parse_dxf_fast(_dxf(SQUARE))
+-         mesh = MeshWithAttributes(data["points"], data["faces"])
+-         out = tmp_path / "m.dxf"
+--        text = mesh.to_dxf(out)
+--        assert out.read_text(encoding="utf-8") == text
+-+        assert mesh.to_dxf(out) is None
+-+        assert out.read_text(encoding="utf-8") == mesh.to_dxf()
+- 
+- 
+- def test_pyvista_optional() -> None:
+diff --git a/examples/example_01_basic_parsing.py b/examples/example_01_basic_parsing.py
+new file mode 100644
+index 0000000..eae4c4b
+--- /dev/null
++++ b/examples/example_01_basic_parsing.py
+@@ -0,0 +1,103 @@
++"""Basic DXF parsing with dxf_io: parse a file, split it into parts, inspect them.
++
++Run with ``marimo edit examples/example_01_basic_parsing.py``.
++"""
++
++import marimo
++
++__generated_with = "0.25.2"
++app = marimo.App()
++
++
++@app.cell
++def _():
++    import tempfile
++    from pathlib import Path
++
++    import marimo as mo
++    import numpy as np
++
++    from dxf_io import diagnose_mesh, dxf_to_manifold_meshes, parse_dxf_fast, write_dxf_fast
++
++    return (
++        Path,
++        diagnose_mesh,
++        dxf_to_manifold_meshes,
++        mo,
++        np,
++        parse_dxf_fast,
++        tempfile,
++        write_dxf_fast,
++    )
++
++
++@app.cell
++def _(Path, np, tempfile, write_dxf_fast):
++    # A demo file: three disjoint unit cubes made of triangles.
++    cube_points = np.array([[x, y, z] for z in (0, 1) for y in (0, 1) for x in (0, 1)], dtype=float)
++    cube_faces = np.array(
++        [[0, 2, 1], [1, 2, 3], [4, 5, 6], [5, 7, 6], [0, 1, 4], [1, 5, 4],
++         [2, 6, 3], [3, 6, 7], [0, 4, 2], [2, 4, 6], [1, 3, 5], [3, 7, 5]]
++    )  # fmt: skip
++    demo_points = np.vstack([cube_points + [3.0 * i, 0.0, 0.0] for i in range(3)])
++    demo_faces = np.vstack([cube_faces + 8 * i for i in range(3)])
++    demo_file = Path(tempfile.mkdtemp()) / "cubes.dxf"
++    write_dxf_fast(demo_points, demo_faces, demo_file)
++    return (demo_file,)
++
++
++@app.cell
++def _(demo_file, mo):
++    dxf_file = mo.ui.text(value=str(demo_file), label="DXF file", full_width=True)
++    decimals = mo.ui.slider(0, 9, value=6, label="Decimals used to merge vertices")
++    mo.vstack([dxf_file, decimals])
++    return decimals, dxf_file
++
++
++@app.cell
++def _(decimals, dxf_file, mo, parse_dxf_fast):
++    raw = parse_dxf_fast(dxf_file.value, decimals=decimals.value)
++    n_components = int(raw["labels"].max()) + 1 if len(raw["labels"]) else 0
++    mo.md(
++        f"""
++        ## Raw mesh
++
++        | | |
++        |---|---|
++        | Points | {len(raw["points"]):,} |
++        | Triangles | {len(raw["faces"]):,} |
++        | Connected components | {n_components:,} |
++        """
++    )
++    return (n_components,)
++
++
++@app.cell
++def _(decimals, dxf_file, dxf_to_manifold_meshes):
++    parts = dxf_to_manifold_meshes(dxf_file.value, use_pyvista=False, decimals=decimals.value)
++    return (parts,)
++
++
++@app.cell
++def _(mo, n_components):
++    component = mo.ui.slider(0, max(n_components - 1, 0), value=0, label="Component")
++    component
++    return (component,)
++
++
++@app.cell
++def _(component, diagnose_mesh, mo, parts):
++    info = diagnose_mesh(parts[component.value]) if parts else None
++    mo.md("No geometry found.") if info is None else mo.md(
++        f"""
++        ## Component {component.value}
++
++        - {info["n_points"]} points, {info["n_faces"]} triangles
++        - x: {info["bounds"]["x"]}, y: {info["bounds"]["y"]}, z: {info["bounds"]["z"]}
++        """
++    )
++    return
++
++
++if __name__ == "__main__":
++    app.run()
+diff --git a/examples/example_02_dxf_writing.py b/examples/example_02_dxf_writing.py
+new file mode 100644
+index 0000000..7ac59c1
+--- /dev/null
++++ b/examples/example_02_dxf_writing.py
+@@ -0,0 +1,89 @@
++"""DXF writing and round trip with dxf_io: parse, transform, write, re-read.
++
++Run with ``marimo edit examples/example_02_dxf_writing.py``.
++"""
++
++import marimo
++
++__generated_with = "0.25.2"
++app = marimo.App()
++
++
++@app.cell
++def _():
++    import tempfile
++    from pathlib import Path
++
++    import marimo as mo
++    import numpy as np
++
++    from dxf_io import parse_dxf_fast, write_dxf_fast
++
++    return Path, mo, np, parse_dxf_fast, tempfile, write_dxf_fast
++
++
++@app.cell
++def _(Path, np, tempfile, write_dxf_fast):
++    # A demo file: a 20 x 20 grid of triangles on a wavy surface.
++    n = 21
++    x, y = np.meshgrid(np.arange(n, dtype=float), np.arange(n, dtype=float))
++    z = np.sin(x / 3) * np.cos(y / 3)
++    grid_points = np.column_stack([x.ravel(), y.ravel(), z.ravel()])
++    ids = np.arange(n * n).reshape(n, n)
++    a, b, c, d = ids[:-1, :-1], ids[:-1, 1:], ids[1:, 1:], ids[1:, :-1]
++    grid_faces = np.vstack(
++        [np.column_stack([a.ravel(), b.ravel(), c.ravel()]),
++         np.column_stack([a.ravel(), c.ravel(), d.ravel()])]
++    )  # fmt: skip
++    workdir = Path(tempfile.mkdtemp())
++    input_file = workdir / "surface.dxf"
++    write_dxf_fast(grid_points, grid_faces, input_file)
++    return input_file, workdir
++
++
++@app.cell
++def _(mo):
++    scale = mo.ui.slider(0.1, 10.0, step=0.1, value=2.0, label="Scale factor")
++    shift_z = mo.ui.number(value=100.0, label="Shift along z")
++    mo.vstack([scale, shift_z])
++    return scale, shift_z
++
++
++@app.cell
++def _(input_file, parse_dxf_fast, scale, shift_z):
++    mesh = parse_dxf_fast(input_file)
++    new_points = mesh["points"] * scale.value + [0.0, 0.0, shift_z.value]
++    return mesh, new_points
++
++
++@app.cell
++def _(mesh, mo, new_points, workdir, write_dxf_fast):
++    output_file = workdir / "surface_transformed.dxf"
++    write_dxf_fast(new_points, mesh["faces"], output_file)
++    preview = write_dxf_fast(new_points[:3], mesh["faces"][:0])  # header only, as a string
++    mo.md(
++        f"Wrote `{output_file}` ({output_file.stat().st_size / 1e3:.0f} kB). "
++        f"Without a file, `write_dxf_fast` returns the DXF text ({len(preview)} characters "
++        "for an empty mesh)."
++    )
++    return (output_file,)
++
++
++@app.cell
++def _(mesh, mo, new_points, np, output_file, parse_dxf_fast):
++    again = parse_dxf_fast(output_file)
++    same_shape = again["faces"].shape == mesh["faces"].shape
++    max_error = float(np.abs(again["points"] - new_points).max())
++    mo.md(
++        f"""
++        ## Round trip
++
++        - Same number of triangles: {"✅" if same_shape else "❌"}
++        - Largest coordinate error: {max_error:.2e} (coordinates are written with 6 decimals)
++        """
++    )
++    return
++
++
++if __name__ == "__main__":
++    app.run()
+diff --git a/examples/example_03_attributes.py b/examples/example_03_attributes.py
+new file mode 100644
+index 0000000..5947959
+--- /dev/null
++++ b/examples/example_03_attributes.py
+@@ -0,0 +1,94 @@
++"""Mesh attributes with dxf_io: attach point and cell data, export to PyVista.
++
++Run with ``marimo edit examples/example_03_attributes.py``.
++PyVista is optional: ``pip install "dxf_io[visualization]"``.
++"""
++
++import marimo
++
++__generated_with = "0.25.2"
++app = marimo.App()
++
++
++@app.cell
++def _():
++    import tempfile
++    from pathlib import Path
++
++    import marimo as mo
++    import numpy as np
++
++    from dxf_io import MeshWithAttributes, dxf_to_manifold_meshes, write_dxf_fast
++
++    try:
++        import pyvista as pv
++    except ImportError:
++        pv = None
++    return MeshWithAttributes, Path, dxf_to_manifold_meshes, mo, np, pv, tempfile, write_dxf_fast
++
++
++@app.cell
++def _(Path, np, tempfile, write_dxf_fast):
++    # A demo file: two tetrahedra at different heights.
++    tetra_points = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1]], dtype=float)
++    tetra_faces = np.array([[0, 2, 1], [0, 1, 3], [0, 3, 2], [1, 2, 3]])
++    points = np.vstack([tetra_points, tetra_points + [3.0, 0.0, 2.0]])
++    faces = np.vstack([tetra_faces, tetra_faces + 4])
++    dxf_file = Path(tempfile.mkdtemp()) / "tetrahedra.dxf"
++    write_dxf_fast(points, faces, dxf_file)
++    return (dxf_file,)
++
++
++@app.cell
++def _(dxf_file, dxf_to_manifold_meshes, mo):
++    parts = dxf_to_manifold_meshes(dxf_file, use_pyvista=False)
++    component = mo.ui.slider(0, len(parts) - 1, value=0, label="Component")
++    component
++    return component, parts
++
++
++@app.cell
++def _(MeshWithAttributes, component, np, parts):
++    part = parts[component.value]
++    tri = part.points[part.faces]  # (n_faces, 3 corners, 3 coordinates)
++    face_area = 0.5 * np.linalg.norm(np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0]), axis=1)
++    mesh = MeshWithAttributes(
++        part.points,
++        part.faces,
++        point_data={"elevation": part.points[:, 2]},
++        cell_data={"area": face_area},
++    )
++    return face_area, mesh
++
++
++@app.cell
++def _(component, face_area, mesh, mo):
++    mo.md(
++        f"""
++        ## Component {component.value}
++
++        - {mesh.n_points} points, {mesh.n_faces} triangles
++        - Point data: {", ".join(mesh.point_data)}; cell data: {", ".join(mesh.cell_data)}
++        - Total area: {face_area.sum():.3f}
++        """
++    )
++    return
++
++
++@app.cell
++def _(mesh, mo, pv):
++    if pv is None:
++        output = mo.md("PyVista is not installed: `pip install 'dxf_io[visualization]'`.")
++    else:
++        poly = mesh.to_pyvista()
++        output = mo.md(
++            f"PyVista mesh: {poly.n_points} points, {poly.n_cells} cells, "
++            f"arrays {list(poly.point_data)} + {list(poly.cell_data)}. "
++            "Use `poly.plot(scalars='area')` to display it."
++        )
++    output
++    return
++
++
++if __name__ == "__main__":
++    app.run()
+diff --git a/examples/example_04_performance.py b/examples/example_04_performance.py
+new file mode 100644
+index 0000000..25c9b90
+--- /dev/null
++++ b/examples/example_04_performance.py
+@@ -0,0 +1,117 @@
++"""Performance of dxf_io on a synthetic file (optionally compared with ezdxf).
++
++Run with ``marimo edit examples/example_04_performance.py``.
++Build the extension in release mode first: ``maturin develop --release``.
++"""
++
++import marimo
++
++__generated_with = "0.25.2"
++app = marimo.App()
++
++
++@app.cell
++def _():
++    import tempfile
++    import time
++    from pathlib import Path
++
++    import marimo as mo
++    import numpy as np
++
++    from dxf_io import dxf_to_manifold_meshes, parse_dxf_fast, write_dxf_fast
++
++    return Path, dxf_to_manifold_meshes, mo, np, parse_dxf_fast, tempfile, time, write_dxf_fast
++
++
++@app.cell
++def _(mo):
++    size = mo.ui.slider(50, 1000, step=50, value=300, label="Grid size (n x n quads)")
++    parts = mo.ui.slider(1, 100, value=4, label="Disjoint parts")
++    compare = mo.ui.checkbox(label="Compare with ezdxf (slow)")
++    mo.vstack([size, parts, compare])
++    return compare, parts, size
++
++
++@app.cell
++def _(Path, np, parts, size, tempfile, write_dxf_fast):
++    def grid(n):
++        x, y = np.meshgrid(np.arange(n + 1, dtype=float), np.arange(n + 1, dtype=float))
++        pts = np.column_stack([x.ravel(), y.ravel(), np.zeros(x.size)])
++        ids = np.arange((n + 1) ** 2).reshape(n + 1, n + 1)
++        a, b, c, d = ids[:-1, :-1], ids[:-1, 1:], ids[1:, 1:], ids[1:, :-1]
++        tris = np.vstack(
++            [np.column_stack([a.ravel(), b.ravel(), c.ravel()]),
++             np.column_stack([a.ravel(), c.ravel(), d.ravel()])]
++        )  # fmt: skip
++        return pts, tris
++
++    n = max(size.value // int(np.sqrt(parts.value)), 1)
++    one_pts, one_tris = grid(n)
++    all_pts = np.vstack([one_pts + [0.0, 0.0, 2.0 * k] for k in range(parts.value)])
++    all_tris = np.vstack([one_tris + k * len(one_pts) for k in range(parts.value)])
++    path = Path(tempfile.mkdtemp()) / "synthetic.dxf"
++    write_dxf_fast(all_pts, all_tris, path)
++    return all_pts, all_tris, path
++
++
++@app.cell
++def _(time):
++    def best_of(func, *args, repeat=3, **kwargs):
++        """Best wall-clock time of ``repeat`` calls, in seconds."""
++        best = float("inf")
++        for _ in range(repeat):
++            start = time.perf_counter()
++            func(*args, **kwargs)
++            best = min(best, time.perf_counter() - start)
++        return best
++
++    return (best_of,)
++
++
++@app.cell
++def _(all_pts, all_tris, best_of, dxf_to_manifold_meshes, parse_dxf_fast, path, write_dxf_fast):
++    timings = {
++        "parse_dxf_fast": best_of(parse_dxf_fast, path),
++        "dxf_to_manifold_meshes": best_of(dxf_to_manifold_meshes, path, use_pyvista=False),
++        "write_dxf_fast (file)": best_of(
++            write_dxf_fast, all_pts, all_tris, path.with_suffix(".out")
++        ),
++        "write_dxf_fast (string)": best_of(write_dxf_fast, all_pts, all_tris),
++    }
++    return (timings,)
++
++
++@app.cell
++def _(compare, path, time):
++    ezdxf_time = None
++    if compare.value:
++        import ezdxf
++
++        start = time.perf_counter()
++        for entity in ezdxf.readfile(str(path)).modelspace().query("3DFACE SOLID"):
++            entity.wcs_vertices()
++        ezdxf_time = time.perf_counter() - start
++    return (ezdxf_time,)
++
++
++@app.cell
++def _(all_tris, ezdxf_time, mo, path, timings):
++    rows = "\n".join(f"| {name} | {t * 1000:.1f} ms |" for name, t in timings.items())
++    if ezdxf_time is not None:
++        speedup = ezdxf_time / timings["parse_dxf_fast"]
++        rows += f"\n| ezdxf (read + iterate) | {ezdxf_time * 1000:.0f} ms ({speedup:.0f}x slower) |"
++    mo.md(
++        f"""
++        ## {path.stat().st_size / 1e6:.1f} MB, {len(all_tris):,} triangles
++
++        | Operation | Best of 3 |
++        |---|---|
++        {rows}
++        """
++    )
++    return
++
++
++if __name__ == "__main__":
++    app.run()
+diff --git a/pyproject.toml b/pyproject.toml
+index 3d0baa8..ef2fec8 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -1,146 +1,115 @@
+ [build-system]
+-requires = ["maturin>=1.5,<2"]
++requires = ["maturin>=1.9,<2"]
+ build-backend = "maturin"
+ 
+ [project]
+ name = "dxf_io"
+-version = "0.1.0"
+-description = "Fast Rust-based DXF mesh reader-writer with pyvista and shapely support."
++# The version is taken from Cargo.toml: bump it there only.
++dynamic = ["version"]
++description = "Fast Rust-based DXF mesh reader and writer (SOLID / 3DFACE) with optional PyVista support."
+ readme = "README.rst"
+-requires-python = ">=3.8"
++requires-python = ">=3.10"
+ authors = [{ name = "Antoine Collet", email = "antoine.collet5@gmail.com" }]
+-keywords = ["DXF", "mesh", "parsing", "geometry", "Rust", "performance"]
+-license = { file = "LICENSE" }
++keywords = ["DXF", "mesh", "parser", "writer", "3DFACE", "geometry", "CAD", "pyvista", "Rust"]
++license = "BSD-3-Clause"
++license-files = ["LICENSE"]
+ classifiers = [
+     "Development Status :: 4 - Beta",
+     "Intended Audience :: Developers",
+     "Intended Audience :: Science/Research",
+-    "License :: OSI Approved :: BSD License",
+     "Natural Language :: English",
++    "Operating System :: MacOS",
++    "Operating System :: Microsoft :: Windows",
++    "Operating System :: POSIX :: Linux",
+     "Programming Language :: Rust",
+     "Programming Language :: Python :: 3",
+-    "Programming Language :: Python :: 3.8",
+-    "Programming Language :: Python :: 3.9",
++    "Programming Language :: Python :: 3 :: Only",
+     "Programming Language :: Python :: 3.10",
+     "Programming Language :: Python :: 3.11",
+     "Programming Language :: Python :: 3.12",
+     "Programming Language :: Python :: 3.13",
+     "Programming Language :: Python :: 3.14",
++    "Programming Language :: Python :: 3.15",
++    "Programming Language :: Python :: Free Threading :: 2 - Beta",
++    "Programming Language :: Python :: Implementation :: CPython",
+     "Topic :: Scientific/Engineering",
+-    "Topic :: Utilities",
+-]
+-
+-dependencies = [
+-    "numpy>=1.20.0",
++    "Topic :: Multimedia :: Graphics :: 3D Modeling",
++    "Typing :: Typed",
+ ]
++dependencies = ["numpy>=1.22"]
+ 
+ [project.optional-dependencies]
+-all = ["dxf_io[dev, docs, lint, tests, visualization, examples]"]
+-visualization = [
+-    "pyvista>=0.40.0",
+-    "pymeshfix>=0.16.0",
+-]
+-manifold = [
+-    "manifold3d>=3.0.0",
+-]
+-examples = ["marimo"]
+-dev = ["maturin>=1.5"]
+-docs = [
+-    "sphinx<9",
+-    "pydata-sphinx-theme",
+-    "sphinx-rtd-theme",
+-]
+-tests = [
+-    "pytest>=7.0",
+-    "pytest-cov",
+-    "coverage",
+-    "pyvista>=0.40.0",
+-    "pymeshfix>=0.16.0",
+-]
+-lint = [
+-    "pre-commit",
+-    "pre-commit-hooks",
+-    "codespell>=2.1.0",
+-    "ruff==0.16.10",
+-    "ty==0.0.78",
+-]
++visualization = ["pyvista>=0.40"]
++manifold = ["manifold3d>=3.0"]
++all = ["dxf_io[visualization,manifold]"]
+ 
+ [project.urls]
+ Homepage = "https://github.com/antoinecollet5/dxf_io"
+ Documentation = "https://github.com/antoinecollet5/dxf_io#readme"
+ Repository = "https://github.com/antoinecollet5/dxf_io"
+ Issues = "https://github.com/antoinecollet5/dxf_io/issues"
+-Changelog = "https://github.com/antoinecollet5/dxf_io/releases"
++Changelog = "https://github.com/antoinecollet5/dxf_io/blob/main/CHANGELOG.md"
++
++# Development dependencies (PEP 735): `uv sync` installs the `dev` group by default,
++# `pip install --group dev` works with pip >= 25.1.
++[dependency-groups]
++# PyVista is optional for the tests (it has no wheels for every Python / platform).
++test = ["pytest>=8", "pytest-cov"]
++lint = ["ruff==0.17.6", "ty==0.0.107", "codespell>=2.3", "pre-commit>=4", "pre-commit-hooks>=5"]
++examples = ["marimo", "pyvista>=0.40"]
++dev = ["maturin>=1.9,<2", "pyvista>=0.40", { include-group = "test" }, { include-group = "lint" }]
+ 
+ [tool.maturin]
+ python-source = "python"
+ module-name = "dxf_io._dxf_io"
+ features = ["pyo3/extension-module"]
++# Keep the source distribution lean; tests are included so that it can be tested.
++include = [{ path = "tests/**/*.py", format = "sdist" }]
++exclude = [
++    { path = "**/__pycache__/**", format = "sdist" },
++    { path = ".github/**", format = "sdist" },
++    { path = ".pre-commit-config.yaml", format = "sdist" },
++]
+ 
+ [tool.ruff]
+-src = ["python", "tests"]
+ line-length = 100
+-
+-exclude = [
+-    ".bzr",
+-    ".direnv",
+-    ".eggs",
+-    ".git",
+-    ".hg",
+-    ".mypy_cache",
+-    ".nox",
+-    ".pants.d",
+-    ".pytype",
+-    ".ruff_cache",
+-    ".svn",
+-    ".tox",
+-    ".venv",
+-    "__pypackages__",
+-    "_build",
+-    "buck-out",
+-    "build",
+-    "dist",
+-    "node_modules",
+-    "venv",
+-]
++extend-include = ["*.pyi"]
+ 
+ [tool.ruff.lint]
+ select = [
+-    "F",    # Pyflakes
+-    "E",    # pycodestyle errors
+-    "W",    # pycodestyle warnings
+-    "I",    # isort
++    "E", "W",   # pycodestyle
++    "F",        # pyflakes
++    "I",        # isort
++    "UP",       # pyupgrade
++    "B",        # bugbear
++    "C4",       # comprehensions
++    "SIM",      # simplify
++    "PT",       # pytest style
++    "NPY",      # numpy-specific rules
++    "PERF",     # performance anti-patterns
++    "RUF",      # ruff-specific rules
+ ]
+-fixable = ["A", "B", "C", "D", "E", "F", "I"]
+-unfixable = []
++
++[tool.ruff.lint.per-file-ignores]
++# marimo notebooks: cells return values and re-import names by design.
++"examples/*.py" = ["B018", "RUF005"]
+ 
+ [tool.ruff.lint.isort]
+ known-first-party = ["dxf_io"]
+ 
+-
+ [tool.ty.src]
+-include = ["python", "tests"]
++include = ["python", "tests", "benchmark.py"]
+ 
+ [tool.ty.analysis]
+ # Optional dependencies, imported lazily.
+-allowed-unresolved-imports = ["manifold3d", "ezdxf"]
++allowed-unresolved-imports = ["manifold3d", "ezdxf", "pyvista"]
++
++[tool.codespell]
++skip = "*.lock,target,.git,*.dxf"
++ignore-words-list = "collet"
+ 
+ [tool.pytest.ini_options]
++minversion = "8.0"
+ testpaths = ["tests"]
+-python_files = ["test_*.py"]
+-addopts = "-v --strict-markers"
+-
+-[tool.coverage.run]
+-source = ["dxf_io"]
+-branch = true
+-
+-[tool.coverage.report]
+-exclude_lines = [
+-    "pragma: no cover",
+-    "def __repr__",
+-    "raise AssertionError",
+-    "raise NotImplementedError",
+-    "if __name__ == .__main__.:",
+-    "if TYPE_CHECKING:",
+-    "^\\s*@abstractmethod",
+-]
++addopts = ["-ra", "--strict-markers", "--strict-config"]
++xfail_strict = true
+diff --git a/python/dxf_io/__init__.py b/python/dxf_io/__init__.py
+index 22ac7eb..c5e4421 100644
+--- a/python/dxf_io/__init__.py
++++ b/python/dxf_io/__init__.py
+@@ -1,5 +1,5 @@
+ """
+-dxf_io: Fast Rust-based DXF mesh reader-writer with pyvista and shapely support.
++dxf_io: fast Rust-based DXF mesh reader and writer, with optional PyVista support.
+ 
+ Provides 10-100x speedup over pure Python implementations for large
+ mesh files (100K+ faces). Includes optional PyVista integration and
+@@ -12,6 +12,8 @@ Basic Usage:
+     ...     print(f"Component {i}: {mesh.n_faces} faces")
+ """
+ 
++from importlib import metadata as _metadata
++
+ from ._core import (
+     MeshWithAttributes,
+     diagnose_mesh,
+@@ -22,13 +24,16 @@ from ._core import (
+     write_dxf_fast,
+ )
+ 
+-__version__ = "0.1.0"
++try:
++    __version__ = _metadata.version("dxf_io")
++except _metadata.PackageNotFoundError:  # pragma: no cover - not installed
++    __version__ = "0.0.0"
+ __all__ = [
++    "MeshWithAttributes",
+     "diagnose_mesh",
+     "dxf_to_manifold_meshes",
+     "from_manifold3d",
+-    "to_manifold3d",
+     "parse_dxf_fast",
++    "to_manifold3d",
+     "write_dxf_fast",
+-    "MeshWithAttributes",
+ ]
+diff --git a/python/dxf_io/_core.py b/python/dxf_io/_core.py
+index 445f854..a00bf79 100644
+--- a/python/dxf_io/_core.py
++++ b/python/dxf_io/_core.py
+@@ -7,7 +7,7 @@ connected-component extraction, and optional PyVista / manifold3d conversion.
+ from __future__ import annotations
+ 
+ import os
+-from typing import TYPE_CHECKING, Any, Optional, Union, overload
++from typing import TYPE_CHECKING, Any, overload
+ 
+ import numpy as np
+ 
+@@ -25,9 +25,7 @@ except ImportError:  # pragma: no cover - depends on the environment
+     HAS_PYVISTA = False
+ 
+ 
+-def parse_dxf_fast(
+-    dxf_file: Union[str, "os.PathLike[str]"], decimals: int = 6
+-) -> dict[str, np.ndarray]:
++def parse_dxf_fast(dxf_file: str | os.PathLike[str], decimals: int = 6) -> dict[str, np.ndarray]:
+     """Parse the SOLID and 3DFACE entities of an ASCII DXF file.
+ 
+     Quads are split into two triangles, and vertices that are equal once rounded to
+@@ -62,13 +60,13 @@ def parse_dxf_fast(
+ def write_dxf_fast(points: np.ndarray, faces: np.ndarray, output_file: None = None) -> str: ...
+ @overload
+ def write_dxf_fast(
+-    points: np.ndarray, faces: np.ndarray, output_file: Union[str, "os.PathLike[str]"]
++    points: np.ndarray, faces: np.ndarray, output_file: str | os.PathLike[str]
+ ) -> None: ...
+ def write_dxf_fast(
+     points: np.ndarray,
+     faces: np.ndarray,
+-    output_file: Optional[Union[str, "os.PathLike[str]"]] = None,
+-) -> Optional[str]:
++    output_file: str | os.PathLike[str] | None = None,
++) -> str | None:
+     """Write a triangle mesh as 3DFACE entities.
+ 
+     Parameters
+@@ -108,9 +106,9 @@ class MeshWithAttributes:
+         self,
+         points: np.ndarray,
+         faces: np.ndarray,
+-        labels: Optional[np.ndarray] = None,
+-        point_data: Optional[dict[str, np.ndarray]] = None,
+-        cell_data: Optional[dict[str, np.ndarray]] = None,
++        labels: np.ndarray | None = None,
++        point_data: dict[str, np.ndarray] | None = None,
++        cell_data: dict[str, np.ndarray] | None = None,
+     ) -> None:
+         self.points = np.asarray(points, dtype=np.float64)
+         self.faces = np.asarray(faces, dtype=np.intp)
+@@ -140,12 +138,12 @@ class MeshWithAttributes:
+     @overload
+     def to_dxf(self, output_file: None = None) -> str: ...
+     @overload
+-    def to_dxf(self, output_file: Union[str, "os.PathLike[str]"]) -> None: ...
+-    def to_dxf(self, output_file: Optional[Union[str, "os.PathLike[str]"]] = None) -> Optional[str]:
++    def to_dxf(self, output_file: str | os.PathLike[str]) -> None: ...
++    def to_dxf(self, output_file: str | os.PathLike[str] | None = None) -> str | None:
+         """Export to DXF (3DFACE entities). See :func:`write_dxf_fast`."""
+-        return write_dxf_fast(self.points, self.faces, output_file)  # type: ignore[call-overload]
++        return write_dxf_fast(self.points, self.faces, output_file)
+ 
+-    def to_pyvista(self) -> "pv.PolyData":
++    def to_pyvista(self) -> pv.PolyData:
+         """Convert to a :class:`pyvista.PolyData` (requires PyVista)."""
+         if _pv is None:
+             raise ImportError("PyVista is required: pip install dxf_io[visualization]")
+@@ -158,23 +156,40 @@ class MeshWithAttributes:
+         return poly
+ 
+ 
+-def _extract_component(
+-    component_id: int, points: np.ndarray, faces: np.ndarray, labels: np.ndarray
+-) -> MeshWithAttributes:
+-    """Extract one connected component, renumbering its vertices from zero."""
+-    point_mask = labels == component_id
+-    new_index = np.cumsum(point_mask) - 1
+-    # All three vertices of a face share one component, so testing the first is enough.
+-    face_mask = labels[faces[:, 0]] == component_id
+-    return MeshWithAttributes(
+-        points[point_mask],
+-        new_index[faces[face_mask]],
+-        np.zeros(int(point_mask.sum()), dtype=np.intp),
+-    )
++def _split_components(
++    points: np.ndarray, faces: np.ndarray, labels: np.ndarray
++) -> list[MeshWithAttributes]:
++    """Split a mesh into its connected components, renumbering vertices from zero.
++
++    Runs in O(N) whatever the number of components: points and faces are grouped by
++    component with one stable (radix) sort each, and every component is a slice.
++    Vertices and faces keep their original relative order inside each component.
++    """
++    n_comp = int(labels.max()) + 1 if len(labels) else 0
++    point_order = np.argsort(labels, kind="stable")
++    point_counts = np.bincount(labels, minlength=n_comp)
++    point_starts = np.concatenate(([0], np.cumsum(point_counts)))
++    # Index of every point inside its own component.
++    local = np.empty(len(labels), dtype=np.intp)
++    local[point_order] = np.arange(len(labels)) - np.repeat(point_starts[:-1], point_counts)
++    # All three vertices of a face share one component, so the first one is enough.
++    face_labels = labels[faces[:, 0]]
++    face_order = np.argsort(face_labels, kind="stable")
++    face_starts = np.concatenate(([0], np.cumsum(np.bincount(face_labels, minlength=n_comp))))
++    sorted_points = points[point_order]
++    sorted_faces = local[faces[face_order]]
++    return [
++        MeshWithAttributes(
++            sorted_points[point_starts[c] : point_starts[c + 1]],
++            sorted_faces[face_starts[c] : face_starts[c + 1]],
++            np.zeros(int(point_counts[c]), dtype=np.intp),
++        )
++        for c in range(n_comp)
++    ]
+ 
+ 
+ def dxf_to_manifold_meshes(
+-    dxf_file: Union[str, "os.PathLike[str]"],
++    dxf_file: str | os.PathLike[str],
+     use_pyvista: bool = True,
+     decimals: int = 6,
+ ) -> list[Any]:
+@@ -196,30 +211,30 @@ def dxf_to_manifold_meshes(
+         One mesh per connected component.
+     """
+     data = parse_dxf_fast(dxf_file, decimals)
+-    meshes: list[Any] = []
+-    for cid in range(int(np.max(data["labels"])) + 1 if len(data["labels"]) else 0):
+-        mesh = _extract_component(cid, data["points"], data["faces"], data["labels"])
+-        meshes.append(mesh.to_pyvista() if use_pyvista and HAS_PYVISTA else mesh)
+-    return meshes
++    meshes = _split_components(data["points"], data["faces"], data["labels"])
++    if use_pyvista and HAS_PYVISTA:
++        return [mesh.to_pyvista() for mesh in meshes]
++    return list(meshes)
++
+ 
++def diagnose_mesh(mesh: MeshWithAttributes | pv.PolyData) -> dict[str, Any]:
++    """Return basic information (counts and bounds) about a mesh.
+ 
+-def diagnose_mesh(mesh: Union[MeshWithAttributes, "pv.PolyData"]) -> dict[str, Any]:
+-    """Return basic information (counts and bounds) about a mesh."""
++    Bounds are NaN for a mesh without points.
++    """
+     if isinstance(mesh, MeshWithAttributes):
+         points, n_faces = mesh.points, mesh.n_faces
+     else:
+         points, n_faces = np.asarray(mesh.points), int(mesh.n_cells)
+-    return {
+-        "n_points": len(points),
+-        "n_faces": n_faces,
+-        "bounds": {
+-            axis: (float(np.min(points[:, i])), float(np.max(points[:, i])))
+-            for i, axis in enumerate("xyz")
+-        },
+-    }
++    if len(points):
++        lo, hi = points.min(axis=0), points.max(axis=0)
++        bounds = {axis: (float(lo[i]), float(hi[i])) for i, axis in enumerate("xyz")}
++    else:
++        bounds = {axis: (float("nan"), float("nan")) for axis in "xyz"}
++    return {"n_points": len(points), "n_faces": n_faces, "bounds": bounds}
+ 
+ 
+-def to_manifold3d(mesh: Union[MeshWithAttributes, "pv.PolyData"]) -> Any:
++def to_manifold3d(mesh: MeshWithAttributes | pv.PolyData) -> Any:
+     """Convert a mesh to a :class:`manifold3d.Manifold` (requires manifold3d)."""
+     try:
+         import manifold3d
+diff --git a/src/lib.rs b/src/lib.rs
+index c020aea..c509330 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -13,6 +13,8 @@ use pyo3::exceptions::PyValueError;
+ use pyo3::prelude::*;
+ use rayon::prelude::*;
+ use rustc_hash::FxHashMap;
++use std::hash::BuildHasher;
++use std::sync::atomic::{AtomicU64, Ordering};
+ 
+ type Vertex = [f64; 3];
+ 
+@@ -245,50 +247,133 @@ struct Mesh {
+     labels: Vec<i64>,
+ }
+ 
++/// Below this many quads, vertex merging runs on a single thread.
++const PARALLEL_MERGE_MIN_QUADS: usize = 1 << 16;
++
+ /// Merge the corners of all quads (vertices equal after rounding to `decimals`
+ /// places are shared) and triangulate them.
+-fn build_mesh(parts: &[Vec<Quad>], decimals: i32) -> Mesh {
++///
++/// Vertices are numbered by order of first appearance, whatever the number of threads.
++/// Corners are distributed over `n_shards` hash maps by hash value; each shard is
++/// filled by its own thread, then the shards are merged by first appearance.
++fn build_mesh(quads: &[Quad], decimals: i32) -> Result<Mesh, String> {
++    let n_corners = quads.len() * 4;
++    if n_corners >= u32::MAX as usize {
++        return Err(format!("too many entities ({})", quads.len()));
++    }
+     let scale = 10f64.powi(decimals);
+-    let n_quads: usize = parts.iter().map(Vec::len).sum();
+-    let mut index: FxHashMap<[i64; 3], i64> =
+-        FxHashMap::with_capacity_and_hasher(n_quads + n_quads / 4, Default::default());
+-    let mut points: Vec<f64> = Vec::with_capacity(n_quads * 3);
+-    let mut faces: Vec<i64> = Vec::with_capacity(n_quads * 6);
+-
+-    for quad in parts.iter().flatten() {
+-        let n_corners = if quad.triangle { 3 } else { 4 };
+-        let mut ids = [0i64; 4];
+-        for (id, v) in ids.iter_mut().zip(&quad.corners).take(n_corners) {
+-            let key = [
+-                (v[0] * scale).round() as i64,
+-                (v[1] * scale).round() as i64,
+-                (v[2] * scale).round() as i64,
+-            ];
+-            let next = (points.len() / 3) as i64;
+-            *id = *index.entry(key).or_insert_with(|| {
+-                points.extend_from_slice(v);
+-                next
+-            });
+-        }
+-        let mut push = |a: i64, b: i64, c: i64| {
+-            // Skip degenerate triangles (repeated vertices).
+-            if a != b && b != c && a != c {
+-                faces.extend_from_slice(&[a, b, c]);
++    let hasher = rustc_hash::FxBuildHasher;
++    let key_of = |v: &Vertex| -> [i64; 3] {
++        [
++            (v[0] * scale).round() as i64,
++            (v[1] * scale).round() as i64,
++            (v[2] * scale).round() as i64,
++        ]
++    };
++    let n_shards = if quads.len() >= PARALLEL_MERGE_MIN_QUADS {
++        rayon::current_num_threads().clamp(1, 64)
++    } else {
++        1
++    };
++
++    // `shard << 32 | shard-local vertex id` of every corner (unused for the 4th corner
++    // of a triangle).
++    let local_id: Vec<AtomicU64> = (0..n_corners).map(|_| AtomicU64::new(0)).collect();
++    // For every shard, the first corner of each of its vertices (increasing).
++    let firsts: Vec<Vec<u32>> = (0..n_shards)
++        .into_par_iter()
++        .map(|shard| {
++            let mut index: FxHashMap<[i64; 3], u32> = FxHashMap::with_capacity_and_hasher(
++                quads.len() / n_shards + quads.len() / (4 * n_shards),
++                hasher,
++            );
++            let mut firsts = Vec::with_capacity(quads.len() / n_shards);
++            for (q, quad) in quads.iter().enumerate() {
++                let n = if quad.triangle { 3 } else { 4 };
++                for (k, v) in quad.corners.iter().take(n).enumerate() {
++                    let key = key_of(v);
++                    if n_shards > 1 && (hasher.hash_one(key) >> 32) as usize % n_shards != shard {
++                        continue;
++                    }
++                    let corner = (4 * q + k) as u32;
++                    let next = firsts.len() as u32;
++                    let id = *index.entry(key).or_insert_with(|| {
++                        firsts.push(corner);
++                        next
++                    });
++                    let packed = (shard as u64) << 32 | u64::from(id);
++                    local_id[corner as usize].store(packed, Ordering::Relaxed);
++                }
+             }
+-        };
+-        push(ids[0], ids[1], ids[2]);
+-        if !quad.triangle {
+-            push(ids[0], ids[2], ids[3]);
++            firsts
++        })
++        .collect();
++
++    // Global vertex ids, by order of first appearance.
++    let (global, first_corners): (Vec<Vec<u32>>, Vec<u32>) = if n_shards == 1 {
++        // Single shard: local ids already are global ids.
++        (Vec::new(), firsts.into_iter().next().unwrap_or_default())
++    } else {
++        let mut all: Vec<(u32, u32, u32)> = firsts
++            .iter()
++            .enumerate()
++            .flat_map(|(s, f)| {
++                f.iter()
++                    .enumerate()
++                    .map(move |(l, &c)| (c, s as u32, l as u32))
++            })
++            .collect();
++        all.par_sort_unstable_by_key(|t| t.0);
++        let mut global: Vec<Vec<u32>> = firsts.iter().map(|f| vec![0; f.len()]).collect();
++        for (g, &(_, s, l)) in all.iter().enumerate() {
++            global[s as usize][l as usize] = g as u32;
+         }
+-    }
++        (global, all.into_iter().map(|t| t.0).collect())
++    };
++
++    let points: Vec<f64> = first_corners
++        .par_iter()
++        .flat_map_iter(|&c| quads[c as usize / 4].corners[c as usize % 4])
++        .collect();
++
++    // Triangulate in parallel, keeping the order of the entities.
++    let vertex = |corner: usize| -> i64 {
++        let packed = local_id[corner].load(Ordering::Relaxed);
++        let id = packed & u64::from(u32::MAX);
++        if n_shards == 1 {
++            return id as i64;
++        }
++        i64::from(global[(packed >> 32) as usize][id as usize])
++    };
++    let faces: Vec<i64> = quads
++        .par_iter()
++        .enumerate()
++        .with_min_len(4096)
++        .flat_map_iter(|(q, quad)| {
++            let n = if quad.triangle { 3 } else { 4 };
++            let mut ids = [0i64; 4];
++            for (k, id) in ids.iter_mut().enumerate().take(n) {
++                *id = vertex(4 * q + k);
++            }
++            let tri = |a: i64, b: i64, c: i64| (a != b && b != c && a != c).then_some([a, b, c]);
++            // Skip degenerate triangles (repeated vertices).
++            let first = tri(ids[0], ids[1], ids[2]);
++            let second = if quad.triangle {
++                None
++            } else {
++                tri(ids[0], ids[2], ids[3])
++            };
++            first.into_iter().chain(second).flatten()
++        })
++        .collect();
+ 
+     let n_points = points.len() / 3;
+     let labels = connected_components(n_points, &faces);
+-    Mesh {
++    Ok(Mesh {
+         points,
+         faces,
+         labels,
+-    }
++    })
+ }
+ 
+ fn find(parent: &mut [u32], mut x: usize) -> usize {
+@@ -332,7 +417,7 @@ fn connected_components(n_points: usize, faces: &[i64]) -> Vec<i64> {
+     labels
+ }
+ 
+-fn parse_dxf(data: &[u8], decimals: i32) -> Mesh {
++fn parse_dxf(data: &[u8], decimals: i32) -> Result<Mesh, String> {
+     // Chunks are only worth it for large inputs.
+     let n_chunks = if data.len() > (4 << 20) {
+         rayon::current_num_threads().max(1) * 4
+@@ -346,7 +431,12 @@ fn parse_dxf(data: &[u8], decimals: i32) -> Mesh {
+         .into_par_iter()
+         .map(|w| parse_chunk(&data[w[0]..w[1]]))
+         .collect();
+-    build_mesh(&parts, decimals)
++    let quads = if parts.len() == 1 {
++        parts.into_iter().next().unwrap_or_default()
++    } else {
++        parts.concat()
++    };
++    build_mesh(&quads, decimals)
+ }
+ 
+ // ---------------------------------------------------------------------------
+@@ -477,7 +567,9 @@ fn into_arrays<'py>(py: Python<'py>, mesh: Mesh) -> PyResult<MeshArrays<'py>> {
+ #[pyfunction]
+ #[pyo3(signature = (data, decimals = 6))]
+ fn parse_dxf_bytes<'py>(py: Python<'py>, data: &[u8], decimals: i32) -> PyResult<MeshArrays<'py>> {
+-    let mesh = py.detach(|| parse_dxf(data, decimals));
++    let mesh = py
++        .detach(|| parse_dxf(data, decimals))
++        .map_err(PyValueError::new_err)?;
+     into_arrays(py, mesh)
+ }
+ 
+@@ -485,9 +577,9 @@ fn parse_dxf_bytes<'py>(py: Python<'py>, data: &[u8], decimals: i32) -> PyResult
+ #[pyfunction]
+ #[pyo3(signature = (path, decimals = 6))]
+ fn parse_dxf_file<'py>(py: Python<'py>, path: PathBuf, decimals: i32) -> PyResult<MeshArrays<'py>> {
+-    let mesh = py.detach(|| -> io::Result<Mesh> {
++    let mesh = py.detach(|| -> PyResult<Mesh> {
+         let data = std::fs::read(&path)?;
+-        Ok(parse_dxf(&data, decimals))
++        parse_dxf(&data, decimals).map_err(PyValueError::new_err)
+     })?;
+     into_arrays(py, mesh)
+ }
+@@ -544,7 +636,8 @@ fn write_dxf_file(
+     Ok(())
+ }
+ 
+-#[pymodule]
++/// The module holds no global state, so it is safe on free-threaded Python builds.
++#[pymodule(gil_used = false)]
+ fn _dxf_io(m: &Bound<'_, PyModule>) -> PyResult<()> {
+     m.add_function(wrap_pyfunction!(parse_dxf_bytes, m)?)?;
+     m.add_function(wrap_pyfunction!(parse_dxf_file, m)?)?;
+@@ -552,3 +645,104 @@ fn _dxf_io(m: &Bound<'_, PyModule>) -> PyResult<()> {
+     m.add_function(wrap_pyfunction!(write_dxf_file, m)?)?;
+     Ok(())
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn face(corners: &[[f64; 3]]) -> String {
++        let mut out = String::from("  0\n3DFACE\n  8\n0\n");
++        for (i, c) in corners.iter().enumerate() {
++            for (axis, v) in c.iter().enumerate() {
++                out += &format!(" {}\n{}\n", 10 * (axis + 1) + i, v);
++            }
++        }
++        out
++    }
++
++    fn grid(n: usize) -> String {
++        let mut out = String::from("  0\nSECTION\n  2\nENTITIES\n");
++        for i in 0..n {
++            for j in 0..n {
++                let (x, y) = (i as f64, j as f64);
++                out += &face(&[
++                    [x, y, 0.0],
++                    [x + 1.0, y, 0.0],
++                    [x + 1.0, y + 1.0, 0.0],
++                    [x, y + 1.0, 0.0],
++                ]);
++            }
++        }
++        out + "  0\nENDSEC\n  0\nEOF\n"
++    }
++
++    #[test]
++    fn fixed6_matches_std_format() {
++        for v in [
++            0.0,
++            -0.0,
++            1.5,
++            -0.5,
++            1234.5678915,
++            1e-9,
++            -1e-9,
++            999_999.999_999_7,
++        ] {
++            let mut buf = Vec::new();
++            push_fixed6(&mut buf, v);
++            let expected = format!("{:.6}", v).replace("-0.000000", "0.000000");
++            assert_eq!(String::from_utf8(buf).unwrap(), expected, "value {v}");
++        }
++    }
++
++    #[test]
++    fn chunked_parse_equals_single_chunk() {
++        let text = grid(60);
++        let data = text.as_bytes();
++        let single = parse_chunk(data);
++        for n in [2, 3, 7, 16, 64] {
++            let bounds = chunk_bounds(data, n);
++            assert!(bounds.windows(2).all(|w| w[0] < w[1]));
++            let chunked: Vec<Quad> = bounds
++                .windows(2)
++                .flat_map(|w| parse_chunk(&data[w[0]..w[1]]))
++                .collect();
++            assert_eq!(chunked.len(), single.len(), "{n} chunks");
++            for (a, b) in chunked.iter().zip(&single) {
++                assert_eq!(a.corners, b.corners);
++                assert_eq!(a.triangle, b.triangle);
++            }
++        }
++    }
++
++    #[test]
++    fn sharded_merge_equals_single_shard() {
++        // Above PARALLEL_MERGE_MIN_QUADS, merging is sharded: the result must not change.
++        let quads = parse_chunk(grid(300).as_bytes());
++        assert!(quads.len() >= PARALLEL_MERGE_MIN_QUADS);
++        let sharded = build_mesh(&quads, 6).unwrap();
++        let pool = rayon::ThreadPoolBuilder::new()
++            .num_threads(1)
++            .build()
++            .unwrap();
++        let serial = pool.install(|| build_mesh(&quads, 6)).unwrap();
++        assert_eq!(sharded.points, serial.points);
++        assert_eq!(sharded.faces, serial.faces);
++        assert_eq!(sharded.labels, serial.labels);
++        assert_eq!(serial.points.len() / 3, 301 * 301);
++        assert_eq!(serial.faces.len() / 3, 2 * 300 * 300);
++        assert!(serial.labels.iter().all(|&l| l == 0));
++    }
++
++    #[test]
++    fn write_then_parse_roundtrip() {
++        let points = [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 5.0, 5.0, 5.0];
++        let faces = [0, 1, 2, 1, 2, 3];
++        let mut out = Vec::new();
++        write_dxf(&mut out, &points, &faces).unwrap();
++        let mesh = parse_dxf(&out, 6).unwrap();
++        assert_eq!(mesh.points, points);
++        assert_eq!(mesh.faces, faces);
++        assert!(check_faces(4, &[0, 1, 4]).is_err());
++    }
++}
+diff --git a/tests/test_basic.py b/tests/test_basic.py
+index 5a317e2..ebdb36f 100644
+--- a/tests/test_basic.py
++++ b/tests/test_basic.py
+@@ -2,7 +2,10 @@
+ 
+ from __future__ import annotations
+ 
++import sys
++import sysconfig
+ from collections.abc import Sequence
++from concurrent.futures import ThreadPoolExecutor
+ from pathlib import Path
+ 
+ import numpy as np
+@@ -173,15 +176,17 @@ class TestWriteFormat:
+         lines = text.splitlines()
+         body = lines[lines.index("ENTITIES") + 1 :]
+         assert body[:6] == ["  0", "3DFACE", "  8", "0", " 62", "1"]
+-        pairs = {k.strip(): v for k, v in zip(body[6:30:2], body[7:30:2])}
++        pairs = {k.strip(): v for k, v in zip(body[6:30:2], body[7:30:2], strict=False)}
+         # Each of the 12 group codes (10-13, 20-23, 30-33) appears exactly once.
+         assert sorted(pairs, key=int) == [
+             str(c) for c in (10, 11, 12, 13, 20, 21, 22, 23, 30, 31, 32, 33)
+         ]
+         assert pairs["10"] == "-0.500000"
+         assert pairs["20"] in ("1234.567891", "1234.567892")
+-        assert pairs["11"] == "0.000000" and pairs["21"] == "0.000000"  # no "-0.000000"
+-        assert pairs["13"] == pairs["12"] and pairs["33"] == pairs["32"]  # triangle
++        assert pairs["11"] == "0.000000"
++        assert pairs["21"] == "0.000000"
++        assert pairs["13"] == pairs["12"]
++        assert pairs["33"] == pairs["32"]
+ 
+     def test_huge_values_fall_back(self) -> None:
+         text = write_dxf_fast(np.array([[1e15, 0, 0], [0, 1, 0], [0, 0, 1]]), np.array([[0, 1, 2]]))
+@@ -214,8 +219,10 @@ class TestWriteFormat:
+             write_dxf_fast(np.zeros((3, 3)), np.array(faces))
+ 
+     def test_bad_shape(self) -> None:
+-        with pytest.raises(ValueError):
++        with pytest.raises(ValueError, match="shape"):
+             write_dxf_fast(np.zeros((3, 2)), np.array([[0, 1, 2]]))
++        with pytest.raises(ValueError, match="2D"):
++            write_dxf_fast(np.zeros(9), np.array([0, 1, 2]))
+ 
+ 
+ class TestComponents:
+@@ -234,6 +241,34 @@ class TestComponents:
+         assert info["n_faces"] == 2
+         assert info["bounds"]["x"] == (0.0, 1.0)
+ 
++    def test_split_many_components_matches_masks(self) -> None:
++        # Interleave the vertices of many components to exercise the renumbering.
++        rng = np.random.default_rng(0)
++        n = 300
++        tris = np.arange(3 * n).reshape(n, 3)
++        perm = rng.permutation(3 * n)
++        points = rng.random((3 * n, 3))[perm]
++        inverse = np.argsort(perm)
++        text = write_dxf_fast(points, inverse[tris])
++        data = parse_dxf_fast(text)
++        meshes = dxf_to_manifold_meshes(text, use_pyvista=False)
++        assert len(meshes) == n
++        labels = data["labels"]
++        for cid, mesh in enumerate(meshes):
++            mask = labels == cid
++            new_index = np.cumsum(mask) - 1
++            faces = data["faces"][labels[data["faces"][:, 0]] == cid]
++            np.testing.assert_array_equal(mesh.points, data["points"][mask])
++            np.testing.assert_array_equal(mesh.faces, new_index[faces])
++
++    def test_diagnose_empty(self) -> None:
++        info = diagnose_mesh(MeshWithAttributes(np.zeros((0, 3)), np.zeros((0, 3), dtype=int)))
++        assert info["n_points"] == 0
++        assert np.isnan(info["bounds"]["x"][0])
++
++    def test_empty_file_has_no_components(self) -> None:
++        assert dxf_to_manifold_meshes(_dxf(), use_pyvista=False) == []
++
+     def test_empty_mesh_properties(self) -> None:
+         mesh = MeshWithAttributes(np.zeros((0, 3)), np.zeros((0, 3), dtype=int))
+         assert (mesh.n_points, mesh.n_faces, mesh.n_components) == (0, 0, 0)
+@@ -271,3 +306,49 @@ def test_pyvista_optional() -> None:
+     (poly,) = dxf_to_manifold_meshes(_dxf(SQUARE), use_pyvista=True)
+     assert isinstance(poly, pv.PolyData)
+     assert poly.n_cells == 2
++
++
++def test_pyvista_conversion_keeps_data() -> None:
++    pytest.importorskip("pyvista")
++    data = parse_dxf_fast(_dxf(SQUARE))
++    mesh = MeshWithAttributes(
++        data["points"],
++        data["faces"],
++        point_data={"id": np.arange(4)},
++        cell_data={"area": np.ones(2)},
++    )
++    poly = mesh.to_pyvista()
++    assert poly.n_points == 4
++    np.testing.assert_array_equal(poly.point_data["id"], np.arange(4))
++    assert diagnose_mesh(poly)["n_faces"] == 2
++
++
++def test_version() -> None:
++    import dxf_io
++
++    assert dxf_io.__version__.count(".") >= 2
++
++
++def test_concurrent_calls_from_threads() -> None:
++    # The extension releases the GIL (and supports free-threaded Python): calls from
++    # several threads at once must give the same results as sequential calls.
++    text = _grid_dxf(60, 2)
++    expected = parse_dxf_fast(text)
++    with ThreadPoolExecutor(max_workers=4) as pool:
++        results = list(pool.map(lambda _: parse_dxf_fast(text), range(8)))
++        written = list(
++            pool.map(lambda _: write_dxf_fast(expected["points"], expected["faces"]), range(8))
++        )
++    for result in results:
++        for key in ("points", "faces", "labels"):
++            np.testing.assert_array_equal(result[key], expected[key])
++    assert len(set(written)) == 1
++
++
++@pytest.mark.skipif(
++    not sysconfig.get_config_var("Py_GIL_DISABLED"), reason="needs a free-threaded Python"
++)
++def test_import_keeps_gil_disabled() -> None:
++    import dxf_io  # noqa: F401
++
++    assert not sys._is_gil_enabled()  # ty: ignore[missing-attribute]

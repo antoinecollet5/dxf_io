@@ -7,7 +7,7 @@ connected-component extraction, and optional PyVista / manifold3d conversion.
 from __future__ import annotations
 
 import os
-from typing import TYPE_CHECKING, Any, Optional, Union, overload
+from typing import TYPE_CHECKING, Any, overload
 
 import numpy as np
 
@@ -25,9 +25,7 @@ except ImportError:  # pragma: no cover - depends on the environment
     HAS_PYVISTA = False
 
 
-def parse_dxf_fast(
-    dxf_file: Union[str, "os.PathLike[str]"], decimals: int = 6
-) -> dict[str, np.ndarray]:
+def parse_dxf_fast(dxf_file: str | os.PathLike[str], decimals: int = 6) -> dict[str, np.ndarray]:
     """Parse the SOLID and 3DFACE entities of an ASCII DXF file.
 
     Quads are split into two triangles, and vertices that are equal once rounded to
@@ -62,13 +60,13 @@ def parse_dxf_fast(
 def write_dxf_fast(points: np.ndarray, faces: np.ndarray, output_file: None = None) -> str: ...
 @overload
 def write_dxf_fast(
-    points: np.ndarray, faces: np.ndarray, output_file: Union[str, "os.PathLike[str]"]
+    points: np.ndarray, faces: np.ndarray, output_file: str | os.PathLike[str]
 ) -> None: ...
 def write_dxf_fast(
     points: np.ndarray,
     faces: np.ndarray,
-    output_file: Optional[Union[str, "os.PathLike[str]"]] = None,
-) -> Optional[str]:
+    output_file: str | os.PathLike[str] | None = None,
+) -> str | None:
     """Write a triangle mesh as 3DFACE entities.
 
     Parameters
@@ -108,9 +106,9 @@ class MeshWithAttributes:
         self,
         points: np.ndarray,
         faces: np.ndarray,
-        labels: Optional[np.ndarray] = None,
-        point_data: Optional[dict[str, np.ndarray]] = None,
-        cell_data: Optional[dict[str, np.ndarray]] = None,
+        labels: np.ndarray | None = None,
+        point_data: dict[str, np.ndarray] | None = None,
+        cell_data: dict[str, np.ndarray] | None = None,
     ) -> None:
         self.points = np.asarray(points, dtype=np.float64)
         self.faces = np.asarray(faces, dtype=np.intp)
@@ -140,12 +138,12 @@ class MeshWithAttributes:
     @overload
     def to_dxf(self, output_file: None = None) -> str: ...
     @overload
-    def to_dxf(self, output_file: Union[str, "os.PathLike[str]"]) -> None: ...
-    def to_dxf(self, output_file: Optional[Union[str, "os.PathLike[str]"]] = None) -> Optional[str]:
+    def to_dxf(self, output_file: str | os.PathLike[str]) -> None: ...
+    def to_dxf(self, output_file: str | os.PathLike[str] | None = None) -> str | None:
         """Export to DXF (3DFACE entities). See :func:`write_dxf_fast`."""
-        return write_dxf_fast(self.points, self.faces, output_file)  # type: ignore[call-overload]
+        return write_dxf_fast(self.points, self.faces, output_file)
 
-    def to_pyvista(self) -> "pv.PolyData":
+    def to_pyvista(self) -> pv.PolyData:
         """Convert to a :class:`pyvista.PolyData` (requires PyVista)."""
         if _pv is None:
             raise ImportError("PyVista is required: pip install dxf_io[visualization]")
@@ -158,23 +156,40 @@ class MeshWithAttributes:
         return poly
 
 
-def _extract_component(
-    component_id: int, points: np.ndarray, faces: np.ndarray, labels: np.ndarray
-) -> MeshWithAttributes:
-    """Extract one connected component, renumbering its vertices from zero."""
-    point_mask = labels == component_id
-    new_index = np.cumsum(point_mask) - 1
-    # All three vertices of a face share one component, so testing the first is enough.
-    face_mask = labels[faces[:, 0]] == component_id
-    return MeshWithAttributes(
-        points[point_mask],
-        new_index[faces[face_mask]],
-        np.zeros(int(point_mask.sum()), dtype=np.intp),
-    )
+def _split_components(
+    points: np.ndarray, faces: np.ndarray, labels: np.ndarray
+) -> list[MeshWithAttributes]:
+    """Split a mesh into its connected components, renumbering vertices from zero.
+
+    Runs in O(N) whatever the number of components: points and faces are grouped by
+    component with one stable (radix) sort each, and every component is a slice.
+    Vertices and faces keep their original relative order inside each component.
+    """
+    n_comp = int(labels.max()) + 1 if len(labels) else 0
+    point_order = np.argsort(labels, kind="stable")
+    point_counts = np.bincount(labels, minlength=n_comp)
+    point_starts = np.concatenate(([0], np.cumsum(point_counts)))
+    # Index of every point inside its own component.
+    local = np.empty(len(labels), dtype=np.intp)
+    local[point_order] = np.arange(len(labels)) - np.repeat(point_starts[:-1], point_counts)
+    # All three vertices of a face share one component, so the first one is enough.
+    face_labels = labels[faces[:, 0]]
+    face_order = np.argsort(face_labels, kind="stable")
+    face_starts = np.concatenate(([0], np.cumsum(np.bincount(face_labels, minlength=n_comp))))
+    sorted_points = points[point_order]
+    sorted_faces = local[faces[face_order]]
+    return [
+        MeshWithAttributes(
+            sorted_points[point_starts[c] : point_starts[c + 1]],
+            sorted_faces[face_starts[c] : face_starts[c + 1]],
+            np.zeros(int(point_counts[c]), dtype=np.intp),
+        )
+        for c in range(n_comp)
+    ]
 
 
 def dxf_to_manifold_meshes(
-    dxf_file: Union[str, "os.PathLike[str]"],
+    dxf_file: str | os.PathLike[str],
     use_pyvista: bool = True,
     decimals: int = 6,
 ) -> list[Any]:
@@ -196,30 +211,30 @@ def dxf_to_manifold_meshes(
         One mesh per connected component.
     """
     data = parse_dxf_fast(dxf_file, decimals)
-    meshes: list[Any] = []
-    for cid in range(int(np.max(data["labels"])) + 1 if len(data["labels"]) else 0):
-        mesh = _extract_component(cid, data["points"], data["faces"], data["labels"])
-        meshes.append(mesh.to_pyvista() if use_pyvista and HAS_PYVISTA else mesh)
-    return meshes
+    meshes = _split_components(data["points"], data["faces"], data["labels"])
+    if use_pyvista and HAS_PYVISTA:
+        return [mesh.to_pyvista() for mesh in meshes]
+    return list(meshes)
 
 
-def diagnose_mesh(mesh: Union[MeshWithAttributes, "pv.PolyData"]) -> dict[str, Any]:
-    """Return basic information (counts and bounds) about a mesh."""
+def diagnose_mesh(mesh: MeshWithAttributes | pv.PolyData) -> dict[str, Any]:
+    """Return basic information (counts and bounds) about a mesh.
+
+    Bounds are NaN for a mesh without points.
+    """
     if isinstance(mesh, MeshWithAttributes):
         points, n_faces = mesh.points, mesh.n_faces
     else:
         points, n_faces = np.asarray(mesh.points), int(mesh.n_cells)
-    return {
-        "n_points": len(points),
-        "n_faces": n_faces,
-        "bounds": {
-            axis: (float(np.min(points[:, i])), float(np.max(points[:, i])))
-            for i, axis in enumerate("xyz")
-        },
-    }
+    if len(points):
+        lo, hi = points.min(axis=0), points.max(axis=0)
+        bounds = {axis: (float(lo[i]), float(hi[i])) for i, axis in enumerate("xyz")}
+    else:
+        bounds = {axis: (float("nan"), float("nan")) for axis in "xyz"}
+    return {"n_points": len(points), "n_faces": n_faces, "bounds": bounds}
 
 
-def to_manifold3d(mesh: Union[MeshWithAttributes, "pv.PolyData"]) -> Any:
+def to_manifold3d(mesh: MeshWithAttributes | pv.PolyData) -> Any:
     """Convert a mesh to a :class:`manifold3d.Manifold` (requires manifold3d)."""
     try:
         import manifold3d

@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import sys
+import sysconfig
 from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -173,15 +176,17 @@ class TestWriteFormat:
         lines = text.splitlines()
         body = lines[lines.index("ENTITIES") + 1 :]
         assert body[:6] == ["  0", "3DFACE", "  8", "0", " 62", "1"]
-        pairs = {k.strip(): v for k, v in zip(body[6:30:2], body[7:30:2])}
+        pairs = {k.strip(): v for k, v in zip(body[6:30:2], body[7:30:2], strict=False)}
         # Each of the 12 group codes (10-13, 20-23, 30-33) appears exactly once.
         assert sorted(pairs, key=int) == [
             str(c) for c in (10, 11, 12, 13, 20, 21, 22, 23, 30, 31, 32, 33)
         ]
         assert pairs["10"] == "-0.500000"
         assert pairs["20"] in ("1234.567891", "1234.567892")
-        assert pairs["11"] == "0.000000" and pairs["21"] == "0.000000"  # no "-0.000000"
-        assert pairs["13"] == pairs["12"] and pairs["33"] == pairs["32"]  # triangle
+        assert pairs["11"] == "0.000000"
+        assert pairs["21"] == "0.000000"
+        assert pairs["13"] == pairs["12"]
+        assert pairs["33"] == pairs["32"]
 
     def test_huge_values_fall_back(self) -> None:
         text = write_dxf_fast(np.array([[1e15, 0, 0], [0, 1, 0], [0, 0, 1]]), np.array([[0, 1, 2]]))
@@ -214,8 +219,10 @@ class TestWriteFormat:
             write_dxf_fast(np.zeros((3, 3)), np.array(faces))
 
     def test_bad_shape(self) -> None:
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="shape"):
             write_dxf_fast(np.zeros((3, 2)), np.array([[0, 1, 2]]))
+        with pytest.raises(ValueError, match="2D"):
+            write_dxf_fast(np.zeros(9), np.array([0, 1, 2]))
 
 
 class TestComponents:
@@ -233,6 +240,34 @@ class TestComponents:
         assert info["n_points"] == 4
         assert info["n_faces"] == 2
         assert info["bounds"]["x"] == (0.0, 1.0)
+
+    def test_split_many_components_matches_masks(self) -> None:
+        # Interleave the vertices of many components to exercise the renumbering.
+        rng = np.random.default_rng(0)
+        n = 300
+        tris = np.arange(3 * n).reshape(n, 3)
+        perm = rng.permutation(3 * n)
+        points = rng.random((3 * n, 3))[perm]
+        inverse = np.argsort(perm)
+        text = write_dxf_fast(points, inverse[tris])
+        data = parse_dxf_fast(text)
+        meshes = dxf_to_manifold_meshes(text, use_pyvista=False)
+        assert len(meshes) == n
+        labels = data["labels"]
+        for cid, mesh in enumerate(meshes):
+            mask = labels == cid
+            new_index = np.cumsum(mask) - 1
+            faces = data["faces"][labels[data["faces"][:, 0]] == cid]
+            np.testing.assert_array_equal(mesh.points, data["points"][mask])
+            np.testing.assert_array_equal(mesh.faces, new_index[faces])
+
+    def test_diagnose_empty(self) -> None:
+        info = diagnose_mesh(MeshWithAttributes(np.zeros((0, 3)), np.zeros((0, 3), dtype=int)))
+        assert info["n_points"] == 0
+        assert np.isnan(info["bounds"]["x"][0])
+
+    def test_empty_file_has_no_components(self) -> None:
+        assert dxf_to_manifold_meshes(_dxf(), use_pyvista=False) == []
 
     def test_empty_mesh_properties(self) -> None:
         mesh = MeshWithAttributes(np.zeros((0, 3)), np.zeros((0, 3), dtype=int))
@@ -271,3 +306,49 @@ def test_pyvista_optional() -> None:
     (poly,) = dxf_to_manifold_meshes(_dxf(SQUARE), use_pyvista=True)
     assert isinstance(poly, pv.PolyData)
     assert poly.n_cells == 2
+
+
+def test_pyvista_conversion_keeps_data() -> None:
+    pytest.importorskip("pyvista")
+    data = parse_dxf_fast(_dxf(SQUARE))
+    mesh = MeshWithAttributes(
+        data["points"],
+        data["faces"],
+        point_data={"id": np.arange(4)},
+        cell_data={"area": np.ones(2)},
+    )
+    poly = mesh.to_pyvista()
+    assert poly.n_points == 4
+    np.testing.assert_array_equal(poly.point_data["id"], np.arange(4))
+    assert diagnose_mesh(poly)["n_faces"] == 2
+
+
+def test_version() -> None:
+    import dxf_io
+
+    assert dxf_io.__version__.count(".") >= 2
+
+
+def test_concurrent_calls_from_threads() -> None:
+    # The extension releases the GIL (and supports free-threaded Python): calls from
+    # several threads at once must give the same results as sequential calls.
+    text = _grid_dxf(60, 2)
+    expected = parse_dxf_fast(text)
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(lambda _: parse_dxf_fast(text), range(8)))
+        written = list(
+            pool.map(lambda _: write_dxf_fast(expected["points"], expected["faces"]), range(8))
+        )
+    for result in results:
+        for key in ("points", "faces", "labels"):
+            np.testing.assert_array_equal(result[key], expected[key])
+    assert len(set(written)) == 1
+
+
+@pytest.mark.skipif(
+    not sysconfig.get_config_var("Py_GIL_DISABLED"), reason="needs a free-threaded Python"
+)
+def test_import_keeps_gil_disabled() -> None:
+    import dxf_io  # noqa: F401
+
+    assert not sys._is_gil_enabled()  # ty: ignore[missing-attribute]

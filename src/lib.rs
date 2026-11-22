@@ -13,6 +13,8 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
+use std::hash::BuildHasher;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 type Vertex = [f64; 3];
 
@@ -245,50 +247,133 @@ struct Mesh {
     labels: Vec<i64>,
 }
 
+/// Below this many quads, vertex merging runs on a single thread.
+const PARALLEL_MERGE_MIN_QUADS: usize = 1 << 16;
+
 /// Merge the corners of all quads (vertices equal after rounding to `decimals`
 /// places are shared) and triangulate them.
-fn build_mesh(parts: &[Vec<Quad>], decimals: i32) -> Mesh {
-    let scale = 10f64.powi(decimals);
-    let n_quads: usize = parts.iter().map(Vec::len).sum();
-    let mut index: FxHashMap<[i64; 3], i64> =
-        FxHashMap::with_capacity_and_hasher(n_quads + n_quads / 4, Default::default());
-    let mut points: Vec<f64> = Vec::with_capacity(n_quads * 3);
-    let mut faces: Vec<i64> = Vec::with_capacity(n_quads * 6);
-
-    for quad in parts.iter().flatten() {
-        let n_corners = if quad.triangle { 3 } else { 4 };
-        let mut ids = [0i64; 4];
-        for (id, v) in ids.iter_mut().zip(&quad.corners).take(n_corners) {
-            let key = [
-                (v[0] * scale).round() as i64,
-                (v[1] * scale).round() as i64,
-                (v[2] * scale).round() as i64,
-            ];
-            let next = (points.len() / 3) as i64;
-            *id = *index.entry(key).or_insert_with(|| {
-                points.extend_from_slice(v);
-                next
-            });
-        }
-        let mut push = |a: i64, b: i64, c: i64| {
-            // Skip degenerate triangles (repeated vertices).
-            if a != b && b != c && a != c {
-                faces.extend_from_slice(&[a, b, c]);
-            }
-        };
-        push(ids[0], ids[1], ids[2]);
-        if !quad.triangle {
-            push(ids[0], ids[2], ids[3]);
-        }
+///
+/// Vertices are numbered by order of first appearance, whatever the number of threads.
+/// Corners are distributed over `n_shards` hash maps by hash value; each shard is
+/// filled by its own thread, then the shards are merged by first appearance.
+fn build_mesh(quads: &[Quad], decimals: i32) -> Result<Mesh, String> {
+    let n_corners = quads.len() * 4;
+    if n_corners >= u32::MAX as usize {
+        return Err(format!("too many entities ({})", quads.len()));
     }
+    let scale = 10f64.powi(decimals);
+    let hasher = rustc_hash::FxBuildHasher;
+    let key_of = |v: &Vertex| -> [i64; 3] {
+        [
+            (v[0] * scale).round() as i64,
+            (v[1] * scale).round() as i64,
+            (v[2] * scale).round() as i64,
+        ]
+    };
+    let n_shards = if quads.len() >= PARALLEL_MERGE_MIN_QUADS {
+        rayon::current_num_threads().clamp(1, 64)
+    } else {
+        1
+    };
+
+    // `shard << 32 | shard-local vertex id` of every corner (unused for the 4th corner
+    // of a triangle).
+    let local_id: Vec<AtomicU64> = (0..n_corners).map(|_| AtomicU64::new(0)).collect();
+    // For every shard, the first corner of each of its vertices (increasing).
+    let firsts: Vec<Vec<u32>> = (0..n_shards)
+        .into_par_iter()
+        .map(|shard| {
+            let mut index: FxHashMap<[i64; 3], u32> = FxHashMap::with_capacity_and_hasher(
+                quads.len() / n_shards + quads.len() / (4 * n_shards),
+                hasher,
+            );
+            let mut firsts = Vec::with_capacity(quads.len() / n_shards);
+            for (q, quad) in quads.iter().enumerate() {
+                let n = if quad.triangle { 3 } else { 4 };
+                for (k, v) in quad.corners.iter().take(n).enumerate() {
+                    let key = key_of(v);
+                    if n_shards > 1 && (hasher.hash_one(key) >> 32) as usize % n_shards != shard {
+                        continue;
+                    }
+                    let corner = (4 * q + k) as u32;
+                    let next = firsts.len() as u32;
+                    let id = *index.entry(key).or_insert_with(|| {
+                        firsts.push(corner);
+                        next
+                    });
+                    let packed = (shard as u64) << 32 | u64::from(id);
+                    local_id[corner as usize].store(packed, Ordering::Relaxed);
+                }
+            }
+            firsts
+        })
+        .collect();
+
+    // Global vertex ids, by order of first appearance.
+    let (global, first_corners): (Vec<Vec<u32>>, Vec<u32>) = if n_shards == 1 {
+        // Single shard: local ids already are global ids.
+        (Vec::new(), firsts.into_iter().next().unwrap_or_default())
+    } else {
+        let mut all: Vec<(u32, u32, u32)> = firsts
+            .iter()
+            .enumerate()
+            .flat_map(|(s, f)| {
+                f.iter()
+                    .enumerate()
+                    .map(move |(l, &c)| (c, s as u32, l as u32))
+            })
+            .collect();
+        all.par_sort_unstable_by_key(|t| t.0);
+        let mut global: Vec<Vec<u32>> = firsts.iter().map(|f| vec![0; f.len()]).collect();
+        for (g, &(_, s, l)) in all.iter().enumerate() {
+            global[s as usize][l as usize] = g as u32;
+        }
+        (global, all.into_iter().map(|t| t.0).collect())
+    };
+
+    let points: Vec<f64> = first_corners
+        .par_iter()
+        .flat_map_iter(|&c| quads[c as usize / 4].corners[c as usize % 4])
+        .collect();
+
+    // Triangulate in parallel, keeping the order of the entities.
+    let vertex = |corner: usize| -> i64 {
+        let packed = local_id[corner].load(Ordering::Relaxed);
+        let id = packed & u64::from(u32::MAX);
+        if n_shards == 1 {
+            return id as i64;
+        }
+        i64::from(global[(packed >> 32) as usize][id as usize])
+    };
+    let faces: Vec<i64> = quads
+        .par_iter()
+        .enumerate()
+        .with_min_len(4096)
+        .flat_map_iter(|(q, quad)| {
+            let n = if quad.triangle { 3 } else { 4 };
+            let mut ids = [0i64; 4];
+            for (k, id) in ids.iter_mut().enumerate().take(n) {
+                *id = vertex(4 * q + k);
+            }
+            let tri = |a: i64, b: i64, c: i64| (a != b && b != c && a != c).then_some([a, b, c]);
+            // Skip degenerate triangles (repeated vertices).
+            let first = tri(ids[0], ids[1], ids[2]);
+            let second = if quad.triangle {
+                None
+            } else {
+                tri(ids[0], ids[2], ids[3])
+            };
+            first.into_iter().chain(second).flatten()
+        })
+        .collect();
 
     let n_points = points.len() / 3;
     let labels = connected_components(n_points, &faces);
-    Mesh {
+    Ok(Mesh {
         points,
         faces,
         labels,
-    }
+    })
 }
 
 fn find(parent: &mut [u32], mut x: usize) -> usize {
@@ -332,7 +417,7 @@ fn connected_components(n_points: usize, faces: &[i64]) -> Vec<i64> {
     labels
 }
 
-fn parse_dxf(data: &[u8], decimals: i32) -> Mesh {
+fn parse_dxf(data: &[u8], decimals: i32) -> Result<Mesh, String> {
     // Chunks are only worth it for large inputs.
     let n_chunks = if data.len() > (4 << 20) {
         rayon::current_num_threads().max(1) * 4
@@ -346,7 +431,12 @@ fn parse_dxf(data: &[u8], decimals: i32) -> Mesh {
         .into_par_iter()
         .map(|w| parse_chunk(&data[w[0]..w[1]]))
         .collect();
-    build_mesh(&parts, decimals)
+    let quads = if parts.len() == 1 {
+        parts.into_iter().next().unwrap_or_default()
+    } else {
+        parts.concat()
+    };
+    build_mesh(&quads, decimals)
 }
 
 // ---------------------------------------------------------------------------
@@ -477,7 +567,9 @@ fn into_arrays<'py>(py: Python<'py>, mesh: Mesh) -> PyResult<MeshArrays<'py>> {
 #[pyfunction]
 #[pyo3(signature = (data, decimals = 6))]
 fn parse_dxf_bytes<'py>(py: Python<'py>, data: &[u8], decimals: i32) -> PyResult<MeshArrays<'py>> {
-    let mesh = py.detach(|| parse_dxf(data, decimals));
+    let mesh = py
+        .detach(|| parse_dxf(data, decimals))
+        .map_err(PyValueError::new_err)?;
     into_arrays(py, mesh)
 }
 
@@ -485,9 +577,9 @@ fn parse_dxf_bytes<'py>(py: Python<'py>, data: &[u8], decimals: i32) -> PyResult
 #[pyfunction]
 #[pyo3(signature = (path, decimals = 6))]
 fn parse_dxf_file<'py>(py: Python<'py>, path: PathBuf, decimals: i32) -> PyResult<MeshArrays<'py>> {
-    let mesh = py.detach(|| -> io::Result<Mesh> {
+    let mesh = py.detach(|| -> PyResult<Mesh> {
         let data = std::fs::read(&path)?;
-        Ok(parse_dxf(&data, decimals))
+        parse_dxf(&data, decimals).map_err(PyValueError::new_err)
     })?;
     into_arrays(py, mesh)
 }
@@ -544,11 +636,113 @@ fn write_dxf_file(
     Ok(())
 }
 
-#[pymodule]
+/// The module holds no global state, so it is safe on free-threaded Python builds.
+#[pymodule(gil_used = false)]
 fn _dxf_io(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(parse_dxf_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(parse_dxf_file, m)?)?;
     m.add_function(wrap_pyfunction!(write_dxf_string, m)?)?;
     m.add_function(wrap_pyfunction!(write_dxf_file, m)?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn face(corners: &[[f64; 3]]) -> String {
+        let mut out = String::from("  0\n3DFACE\n  8\n0\n");
+        for (i, c) in corners.iter().enumerate() {
+            for (axis, v) in c.iter().enumerate() {
+                out += &format!(" {}\n{}\n", 10 * (axis + 1) + i, v);
+            }
+        }
+        out
+    }
+
+    fn grid(n: usize) -> String {
+        let mut out = String::from("  0\nSECTION\n  2\nENTITIES\n");
+        for i in 0..n {
+            for j in 0..n {
+                let (x, y) = (i as f64, j as f64);
+                out += &face(&[
+                    [x, y, 0.0],
+                    [x + 1.0, y, 0.0],
+                    [x + 1.0, y + 1.0, 0.0],
+                    [x, y + 1.0, 0.0],
+                ]);
+            }
+        }
+        out + "  0\nENDSEC\n  0\nEOF\n"
+    }
+
+    #[test]
+    fn fixed6_matches_std_format() {
+        for v in [
+            0.0,
+            -0.0,
+            1.5,
+            -0.5,
+            1234.5678915,
+            1e-9,
+            -1e-9,
+            999_999.999_999_7,
+        ] {
+            let mut buf = Vec::new();
+            push_fixed6(&mut buf, v);
+            let expected = format!("{:.6}", v).replace("-0.000000", "0.000000");
+            assert_eq!(String::from_utf8(buf).unwrap(), expected, "value {v}");
+        }
+    }
+
+    #[test]
+    fn chunked_parse_equals_single_chunk() {
+        let text = grid(60);
+        let data = text.as_bytes();
+        let single = parse_chunk(data);
+        for n in [2, 3, 7, 16, 64] {
+            let bounds = chunk_bounds(data, n);
+            assert!(bounds.windows(2).all(|w| w[0] < w[1]));
+            let chunked: Vec<Quad> = bounds
+                .windows(2)
+                .flat_map(|w| parse_chunk(&data[w[0]..w[1]]))
+                .collect();
+            assert_eq!(chunked.len(), single.len(), "{n} chunks");
+            for (a, b) in chunked.iter().zip(&single) {
+                assert_eq!(a.corners, b.corners);
+                assert_eq!(a.triangle, b.triangle);
+            }
+        }
+    }
+
+    #[test]
+    fn sharded_merge_equals_single_shard() {
+        // Above PARALLEL_MERGE_MIN_QUADS, merging is sharded: the result must not change.
+        let quads = parse_chunk(grid(300).as_bytes());
+        assert!(quads.len() >= PARALLEL_MERGE_MIN_QUADS);
+        let sharded = build_mesh(&quads, 6).unwrap();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        let serial = pool.install(|| build_mesh(&quads, 6)).unwrap();
+        assert_eq!(sharded.points, serial.points);
+        assert_eq!(sharded.faces, serial.faces);
+        assert_eq!(sharded.labels, serial.labels);
+        assert_eq!(serial.points.len() / 3, 301 * 301);
+        assert_eq!(serial.faces.len() / 3, 2 * 300 * 300);
+        assert!(serial.labels.iter().all(|&l| l == 0));
+    }
+
+    #[test]
+    fn write_then_parse_roundtrip() {
+        let points = [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 5.0, 5.0, 5.0];
+        let faces = [0, 1, 2, 1, 2, 3];
+        let mut out = Vec::new();
+        write_dxf(&mut out, &points, &faces).unwrap();
+        let mesh = parse_dxf(&out, 6).unwrap();
+        assert_eq!(mesh.points, points);
+        assert_eq!(mesh.faces, faces);
+        assert!(check_faces(4, &[0, 1, 4]).is_err());
+    }
 }

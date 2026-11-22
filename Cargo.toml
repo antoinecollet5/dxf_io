@@ -2,9 +2,20 @@
 name = "dxf_io"
 version = "0.1.0"
 edition = "2021"
+description = "Fast Rust-based DXF mesh reader-writer for Python."
+license = "BSD-3-Clause"
+repository = "https://github.com/antoinecollet5/dxf_io"
+readme = "README.rst"
+publish = false
+
+[lib]
+name = "_dxf_io"
+crate-type = ["cdylib"]
 
 [dependencies]
-pyo3 = { version = "0.29", features = ["extension-module"] }
+# `extension-module` is enabled by maturin (see pyproject.toml), not here, so that
+# `cargo test` can link against libpython.
+pyo3 = "0.29"
 numpy = "0.29"
 ndarray = "0.16"
 rustc-hash = "2.1"
@@ -12,12 +23,8 @@ rayon = "1.10"
 memchr = "2.7"
 fast-float2 = "0.2"
 
-
 [profile.release]
 opt-level = 3
-lto = true
+lto = "fat"
 codegen-units = 1
-
-[lib]
-name = "_dxf_io"
-crate-type = ["cdylib"]
+strip = true

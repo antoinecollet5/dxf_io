@@ -4,23 +4,76 @@ dxf_io
 
 |License| |Python| |PyPI| |Build Status| |codecov| |Ruff| |ty|
 
-🚀 **Fast Rust-based DXF mesh reader-writer with pyvista and shapely support.** — 10–100x speedup over pure Python (ezdxf).
+🚀 **Fast Rust-based DXF mesh reader and writer, with optional PyVista support** — 10–100x faster than pure Python (ezdxf).
+
+``dxf_io`` reads the ``SOLID`` and ``3DFACE`` entities of ASCII DXF files into NumPy
+arrays (merging duplicate vertices and finding connected components), and writes
+triangle meshes back as ``3DFACE`` entities.
 
 **The complete documentation can be found here**: `GitHub Repository <https://github.com/antoinecollet5/dxf_io>`_.
 
+===============
+📦 Installation
+===============
+
+Pre-built wheels are available for Linux (x86_64, aarch64; glibc and musl), macOS
+(Intel and Apple Silicon) and Windows (x64, ARM64), for CPython 3.10 to 3.15, including
+free-threaded builds:
+
+.. code-block:: bash
+
+    pip install dxf_io                  # NumPy only
+    pip install "dxf_io[visualization]" # + PyVista
+    pip install "dxf_io[all]"           # + PyVista and manifold3d
+
+Installing from source requires a `Rust toolchain <https://rustup.rs>`_.
+
+==============
+🧭 Quick start
+==============
+
+.. code-block:: python
+
+    from dxf_io import dxf_to_manifold_meshes, parse_dxf_fast, write_dxf_fast
+
+    # Raw arrays: points (N, 3) float64, faces (M, 3) and labels (N,) intp.
+    mesh = parse_dxf_fast("model.dxf", decimals=6)
+    print(mesh["points"].shape, mesh["faces"].shape)
+
+    # One mesh per connected component (pyvista.PolyData if PyVista is installed).
+    parts = dxf_to_manifold_meshes("model.dxf", use_pyvista=False)
+    for part in parts:
+        print(part.n_points, part.n_faces)
+
+    # Write a triangle mesh (to a file, or to a string when no file is given).
+    write_dxf_fast(mesh["points"], mesh["faces"], "out.dxf")
 
 ===============
 ⚡ Performance
 ===============
 
-Parsing and writing run in Rust, use all the available cores and release the GIL.
-On a 190 MB file (4 million vertices, 2 million triangles), parsing takes under a second
-and writing about one second on a 2-core machine. On a 16 MB file, ``dxf_io`` is about
-100x faster than `ezdxf <https://ezdxf.mozman.at>`_ at merely reading and iterating the
-faces (and it also merges the vertices and finds the connected components).
+Parsing, vertex merging and writing run in Rust, use all the available cores and release
+the GIL. On a 67 MB file (360,000 vertices, 720,000 triangles), parsing takes about
+0.15 s and writing about 0.2 s on a 2-core machine, about 65x faster than
+`ezdxf <https://ezdxf.mozman.at>`_ merely reading and iterating the faces (``dxf_io``
+also merges the vertices and finds the connected components). Splitting a mesh into its
+components is linear in its size, whatever the number of components.
 
-Reproduce with ``python benchmark.py --synthetic 150 --ezdxf`` after
+Reproduce with ``python benchmark.py --synthetic 300 --ezdxf`` after
 ``maturin develop --release``.
+
+==============
+🛠️ Development
+==============
+
+.. code-block:: bash
+
+    uv sync                               # builds the extension, installs dev tools
+    uv run pytest && cargo test           # Python and Rust tests
+    uv run ruff check . && uv run ruff format --check . && uv run ty check
+
+See `CONTRIBUTING.md <https://github.com/antoinecollet5/dxf_io/blob/main/CONTRIBUTING.md>`_
+for the release process.
 
 ===========
 🔑 License
@@ -73,7 +126,7 @@ Contributions are welcome!
     :target: https://pypi.org/project/dxf_io/
     :alt: PyPI
 
-.. |Build Status| image:: https://github.com/antoinecollet5/dxf_io/workflows/CI/badge.svg
+.. |Build Status| image:: https://github.com/antoinecollet5/dxf_io/actions/workflows/main.yml/badge.svg
     :target: https://github.com/antoinecollet5/dxf_io/actions/workflows/main.yml
     :alt: Build Status
 
