@@ -45,7 +45,7 @@ all = ["dxf_io[visualization,manifold]"]
 
 [project.urls]
 Homepage = "https://github.com/antoinecollet5/dxf_io"
-Documentation = "https://github.com/antoinecollet5/dxf_io#readme"
+Documentation = "https://dxf-io.readthedocs.io"
 Repository = "https://github.com/antoinecollet5/dxf_io"
 Issues = "https://github.com/antoinecollet5/dxf_io/issues"
 Changelog = "https://github.com/antoinecollet5/dxf_io/blob/master/CHANGELOG.md"
@@ -57,7 +57,25 @@ Changelog = "https://github.com/antoinecollet5/dxf_io/blob/master/CHANGELOG.md"
 test = ["pytest>=8", "pytest-cov"]
 lint = ["ruff==0.17.6", "ty==0.0.107", "codespell>=2.3", "pre-commit>=4", "pre-commit-hooks>=5"]
 examples = ["marimo", "pyvista>=0.40"]
-dev = ["maturin>=1.9,<2", "pyvista>=0.40", { include-group = "test" }, { include-group = "lint" }]
+# Building the documentation needs neither Rust nor an installed dxf_io (see docs/sources/conf.py).
+docs = [
+    "numpy>=1.22",
+    "sphinx>=8",
+    "pydata-sphinx-theme>=0.16",
+    "myst-parser>=4",
+    "sphinx-copybutton>=0.5",
+]
+dev = [
+    "maturin>=1.9,<2",
+    "pyvista>=0.40",
+    { include-group = "test" },
+    { include-group = "lint" },
+    { include-group = "docs" },
+]
+
+[tool.uv]
+# `uv sync` / `uv run` rebuild the extension (release mode) whenever the Rust code changes.
+cache-keys = [{ file = "pyproject.toml" }, { file = "Cargo.toml" }, { file = "src/**/*.rs" }]
 
 [tool.maturin]
 python-source = "python"
@@ -96,6 +114,8 @@ select = [
 
 [tool.ruff.lint.isort]
 known-first-party = ["dxf_io"]
+# docs/sources/conf.py runs on Python >= 3.11, where tomllib is in the standard library.
+extra-standard-library = ["tomllib"]
 
 [tool.ty.src]
 include = ["python", "tests", "benchmark.py"]

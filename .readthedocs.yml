@@ -1,0 +1,23 @@
+# .readthedocs.yml
+# Read the Docs configuration file
+# See https://docs.readthedocs.io/en/stable/config-file/v2.html for details
+
+# Required
+version: 2
+
+# Build documentation in the docs/ directory with Sphinx
+sphinx:
+  configuration: docs/sources/conf.py
+  fail_on_warning: true
+
+build:
+  os: ubuntu-24.04
+  tools:
+    python: "3.13"
+  jobs:
+    # The documentation imports dxf_io from python/ and mocks its compiled Rust
+    # extension (see docs/sources/conf.py): only the "docs" dependency group is
+    # installed, so no Rust toolchain and no compilation are needed.
+    install:
+      - pip install --upgrade pip
+      - pip install --group docs

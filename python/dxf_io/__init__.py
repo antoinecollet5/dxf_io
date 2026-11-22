@@ -1,15 +1,42 @@
 """
-dxf_io: fast Rust-based DXF mesh reader and writer, with optional PyVista support.
+Purpose
+=======
 
-Provides 10-100x speedup over pure Python implementations for large
-mesh files (100K+ faces). Includes optional PyVista integration and
-DXF writing capabilities.
+**dxf_io** is a fast DXF mesh reader and writer written in Rust. It reads the
+``SOLID`` and ``3DFACE`` entities of ASCII DXF files into NumPy arrays (merging
+duplicate vertices and labelling connected components) and writes triangle meshes back
+as ``3DFACE`` entities, using all the available cores and without holding the GIL.
 
-Basic Usage:
-    >>> from dxf_io import dxf_to_manifold_meshes
-    >>> meshes = dxf_to_manifold_meshes("model.dxf")
-    >>> for i, mesh in enumerate(meshes):
-    ...     print(f"Component {i}: {mesh.n_faces} faces")
+The following functionalities are directly provided on module-level.
+
+Reading and writing
+===================
+
+.. autosummary::
+   :toctree: _autosummary
+
+   parse_dxf_fast
+   dxf_to_manifold_meshes
+   write_dxf_fast
+
+Meshes
+======
+
+.. autosummary::
+   :toctree: _autosummary
+
+   MeshWithAttributes
+
+Utilities
+=========
+
+.. autosummary::
+   :toctree: _autosummary
+
+   diagnose_mesh
+   to_manifold3d
+   from_manifold3d
+
 """
 
 from importlib import metadata as _metadata

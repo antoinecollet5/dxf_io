@@ -39,10 +39,10 @@ clean-pyc: ## remove Python file artifacts
 
 clean-test: ## remove test and coverage artifacts
 	rm -fr .tox/ .coverage .coverage.* htmlcov/ .pytest_cache .ruff_cache
+	rm -fr docs/build/ docs/sources/_autosummary/
 
-install-dev: ## install the package in development mode (release build; rerun after `make clean`)
+install-dev: ## install the package and the dev tools (rebuilds the extension when the Rust code changed)
 	uv sync
-	uv run maturin develop --release
 
 build: ## build a release wheel for the current platform
 	uv run maturin build --release
@@ -59,7 +59,7 @@ lint: ## lint and format-check everything (ruff, ty, codespell, rustfmt, clippy)
 	uv run ruff check .
 	uv run ruff format --check .
 	uv run ty check
-	uv run codespell python tests src README.rst CHANGELOG.md CONTRIBUTING.md
+	uv run codespell python tests src docs/sources README.rst CHANGELOG.md CONTRIBUTING.md
 	cargo fmt --check
 	cargo clippy --all-targets -- -D warnings
 
@@ -74,8 +74,13 @@ dist: ## build the sdist and a release wheel for the current platform
 	uv run maturin build --release -o dist
 	ls -lh dist/
 
+docs: ## generate the Sphinx HTML documentation, including the API reference
+	rm -fr docs/build/ docs/sources/_autosummary/
+	uv run --only-group docs python -m sphinx -W --keep-going -b html docs/sources docs/build/html
+	$(BROWSER) docs/build/html/index.html
+
 benchmark: ## run performance benchmark
 	uv run python benchmark.py --synthetic 300
 
-.PHONY: all build test test-cov lint format dist benchmark
+.PHONY: all build test test-cov lint format dist docs benchmark
 all: lint test dist ## lint, test and build the distributions

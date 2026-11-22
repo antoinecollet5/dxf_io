@@ -2,7 +2,7 @@
 dxf_io
 =================
 
-|License| |Python| |PyPI| |Build Status| |codecov| |Ruff| |ty|
+|License| |Python| |PyPI| |Build Status| |Documentation Status| |codecov| |Ruff| |ty|
 
 🚀 **Fast Rust-based DXF mesh reader and writer, with optional PyVista support** — 10–100x faster than pure Python (ezdxf).
 
@@ -10,7 +10,7 @@ dxf_io
 arrays (merging duplicate vertices and finding connected components), and writes
 triangle meshes back as ``3DFACE`` entities.
 
-**The complete documentation can be found here**: `GitHub Repository <https://github.com/antoinecollet5/dxf_io>`_.
+**The complete and up to date documentation can be found here**: https://dxf-io.readthedocs.io.
 
 ===============
 📦 Installation
@@ -59,8 +59,7 @@ the GIL. On a 67 MB file (360,000 vertices, 720,000 triangles), parsing takes ab
 also merges the vertices and finds the connected components). Splitting a mesh into its
 components is linear in its size, whatever the number of components.
 
-Reproduce with ``python benchmark.py --synthetic 300 --ezdxf`` after
-``maturin develop --release``.
+Reproduce with ``uv run --with ezdxf python benchmark.py --synthetic 300 --ezdxf``.
 
 ==============
 🛠️ Development
@@ -138,6 +137,10 @@ Contributions are welcome!
 .. |Build Status| image:: https://github.com/antoinecollet5/dxf_io/actions/workflows/main.yml/badge.svg
     :target: https://github.com/antoinecollet5/dxf_io/actions/workflows/main.yml
     :alt: Build Status
+
+.. |Documentation Status| image:: https://readthedocs.org/projects/dxf-io/badge/?version=latest
+    :target: https://dxf-io.readthedocs.io/en/latest/?badge=latest
+    :alt: Documentation Status
 
 .. |codecov| image:: https://codecov.io/gh/antoinecollet5/dxf_io/graph/badge.svg?token=CxdQ0SkRbx
     :target: https://codecov.io/gh/antoinecollet5/dxf_io

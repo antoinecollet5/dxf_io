@@ -20,7 +20,7 @@ except ImportError as exc:  # pragma: no cover - depends on the installation
         "The compiled extension of dxf_io (dxf_io._dxf_io) is missing or was built for "
         f"another Python version (this is Python {sys.version_info.major}."
         f"{sys.version_info.minor}). In a development checkout, rebuild it with "
-        "`maturin develop --release` (or `uv sync --reinstall-package dxf_io`); "
+        "`uv sync --reinstall-package dxf_io` (or `maturin develop --release`); "
         "otherwise reinstall dxf_io with pip."
     ) from exc
 
@@ -115,7 +115,32 @@ def write_dxf_fast(
 
 
 class MeshWithAttributes:
-    """Triangle mesh with optional point and cell data."""
+    """Triangle mesh with optional point and cell data.
+
+    Parameters
+    ----------
+    points : numpy.ndarray
+        (N, 3) vertex coordinates (converted to float64).
+    faces : numpy.ndarray
+        (M, 3) vertex indices of the triangles (converted to intp).
+    labels : numpy.ndarray, optional
+        (N,) connected-component id of each vertex. All zeros by default.
+    point_data : dict of str to numpy.ndarray, optional
+        Arrays of length N, attached to the vertices.
+    cell_data : dict of str to numpy.ndarray, optional
+        Arrays of length M, attached to the triangles.
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> mesh = MeshWithAttributes(
+    ...     np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]),
+    ...     np.array([[0, 1, 2]]),
+    ...     cell_data={"area": np.array([0.5])},
+    ... )
+    >>> mesh.n_points, mesh.n_faces, mesh.n_components
+    (3, 1, 1)
+    """
 
     def __init__(
         self,

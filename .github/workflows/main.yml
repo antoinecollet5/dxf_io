@@ -61,7 +61,7 @@ jobs:
         run: uv run --no-sync ty check --output-format=github
 
       - name: codespell
-        run: uv run --no-sync codespell python tests src README.rst CHANGELOG.md CONTRIBUTING.md
+        run: uv run --no-sync codespell python tests src docs/sources README.rst CHANGELOG.md CONTRIBUTING.md
 
       - name: rustfmt
         run: cargo fmt --check
@@ -77,6 +77,24 @@ jobs:
         run: |
           export LD_LIBRARY_PATH="$("$PYO3_PYTHON" -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
           cargo test --release
+
+  docs:
+    name: Documentation (Sphinx, warnings as errors)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+
+      - name: Install the documentation dependencies
+        run: |
+          uv venv --python 3.13
+          uv pip install --group docs
+
+      - name: Build the documentation
+        run: uv run --no-sync python -m sphinx -W --keep-going -b html docs/sources docs/build/html
 
   test:
     name: Test ${{ matrix.os }} / Python ${{ matrix.python }}

@@ -220,3 +220,7 @@ __marimo__/
 .streamlit/secrets.toml
 .vscode/settings.json
 uv.lock
+
+# Sphinx documentation
+docs/build/
+docs/sources/_autosummary/

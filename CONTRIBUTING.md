@@ -13,8 +13,11 @@ uv sync                 # builds the extension (editable) and installs the dev t
 uv run pre-commit install
 ```
 
-After changing Rust code, rebuild with `uv run maturin develop --release`
-(or `make install-dev`).
+`uv sync` and `uv run` rebuild the extension (in release mode) whenever the Rust code
+changed, so there is no separate build step.
+
+Use uv's `.venv` on its own: if a conda environment is active, run `conda deactivate`
+first (maturin refuses to run when both `VIRTUAL_ENV` and `CONDA_PREFIX` are set).
 
 ## Checks
 
@@ -25,6 +28,15 @@ make benchmark          # timings on a synthetic file
 ```
 
 CI runs the same checks on Linux, macOS and Windows for every supported Python version.
+
+## Documentation
+
+The documentation (Sphinx, in `docs/sources`) is published on
+<https://dxf-io.readthedocs.io> for every push to `master`. Build it locally with
+`make docs` (no Rust build needed: the compiled extension is mocked; without network
+access, set `DXF_IO_DOCS_OFFLINE=1`). The API reference
+is generated from the docstrings (NumPy style) of the functions listed in
+`python/dxf_io/__init__.py`.
 
 ## Code style
 
